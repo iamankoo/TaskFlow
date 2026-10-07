@@ -2,7 +2,7 @@
 
 A distributed job execution platform in C++20: REST API, priority scheduler, delayed jobs, DAG dependencies, concurrent worker pool, lease/heartbeat failure recovery, retries and idempotency. PostgreSQL is the durable source of truth; Redis is a fast, rebuildable coordination layer.
 
-> **Status:** Phase 1 of 10 (foundation). The platform does not run jobs yet. See [`Phases.md`](Phases.md) for the roadmap, [`ARCHITECTURE.md`](ARCHITECTURE.md) for the design, [`TECHSTACK.md`](TECHSTACK.md) for the locked stack and [`summary.md`](summary.md) for what is actually implemented.
+> **Status:** Phase 2 of 10 complete (foundation and persistent job model). Jobs can be stored, tracked and given results in PostgreSQL, but the platform does not schedule or run them yet, and there is no job API. See [`Phases.md`](Phases.md) for the roadmap, [`ARCHITECTURE.md`](ARCHITECTURE.md) for the design, [`TECHSTACK.md`](TECHSTACK.md) for the locked stack and [`summary.md`](summary.md) for what is actually implemented.
 
 ## Quick start (Docker)
 
@@ -41,8 +41,8 @@ Presets: `debug`, `release`, `asan` (AddressSanitizer + UBSan), `tsan` (ThreadSa
 
 | Suite | Needs services | Label | What it covers |
 |---|---|---|---|
-| `taskflow_unit_tests` | no | `unit` | config, errors, resource pool, logging, health service, migration loading |
-| `taskflow_integration_tests` | PostgreSQL, Redis | `integration` | connectivity, pooling, migration runner, Redis commands, application failure paths |
+| `taskflow_unit_tests` | no | `unit` | config, errors, resource pool, logging, health service, migration loading, job state machine, job model validation |
+| `taskflow_integration_tests` | PostgreSQL, Redis | `integration` | connectivity, pooling, migration runner, Redis commands, application failure paths, job schema constraints and triggers, job repository, transaction rollback |
 | `taskflow_http_tests` | PostgreSQL, Redis | `http` | the real server and `GET /health` over TCP, graceful shutdown |
 
 ```bash
@@ -74,7 +74,7 @@ Exit codes: `0` ok, `1` runtime failure, `2` bad arguments, `3` invalid configur
 include/taskflow/   public headers, one directory per module
 src/                implementations (common, config, logging, db, redis, api, app)
 tests/              unit/, integration/, http/, support/
-migrations/         versioned SQL (mechanism only in Phase 1)
+migrations/         versioned SQL (job schema: see docs/DATABASE.md)
 docker/             Dockerfile (toolchain, deps, build, test, runtime stages)
 .github/workflows/  CI
 ```
@@ -82,9 +82,10 @@ docker/             Dockerfile (toolchain, deps, build, test, runtime stages)
 | Module | Responsibility |
 |---|---|
 | `common` | error types, generic bounded resource pool |
+| `jobs` | job domain model and the job state machine |
 | `config` | defaults, JSON file, environment overrides, validation |
 | `logging` | spdlog setup, text or JSON output |
-| `db` | libpq connection and pool, forward-only migration runner |
+| `db` | libpq connection, pool and transactions, forward-only migration runner, `JobRepository` (all job SQL) |
 | `redis` | hiredis connection and pool |
 | `api` | Drogon HTTP server, `/health` |
 | `app` | startup, dependency wait, shutdown, signal handling |

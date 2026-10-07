@@ -76,25 +76,27 @@ If documents conflict, stop and resolve the conflict before implementing. Archit
 
 ## Phase 2 — Job Model & Persistent State
 
-**Objective.** Define the job domain model and make PostgreSQL the durable source of truth for all job state.
+**Objective.** Define the job domain model and make PostgreSQL the durable source of truth for all job state: a job can be created, persisted, read, moved through its states, tracked across attempts and given a persisted result.
 
-**Scope.** Schema, migrations, repositories, state machine enforcement. No scheduling or execution.
+**Scope.** Schema, migrations, domain types, state machine enforcement, repository. No scheduling, queues, dependencies, workers, leasing or job API. (`job_dependencies` is introduced with the DAG engine in Phase 4 and `workers` with the worker pool in Phase 5, so each table arrives together with the code that uses it.)
 
 **Implementation tasks.**
-- Domain types: `Job`, `JobState`, `JobPriority`, `JobDependency`, `Worker`, `JobAttempt`, `JobEvent`.
-- Job state machine (as defined in `ARCHITECTURE.md`) with a single transition function that rejects illegal transitions.
-- Migration tooling and versioned SQL migrations for `jobs`, `job_dependencies`, `job_attempts`, `workers`, `job_events`, and supporting indexes.
-- Repository layer with transactional operations, optimistic concurrency (`version` column), and `SELECT ... FOR UPDATE SKIP LOCKED` primitives.
+- Domain types: `Job`, `NewJob`, `JobState`, `JobPriority`, `JobId`, `RetryPolicy`, `JobAttempt`, `JobResult`, `JobEvent`.
+- Job state machine (as defined in `ARCHITECTURE.md`) with a single transition function that rejects illegal transitions, mirrored by a database trigger.
+- Versioned SQL migrations for `jobs`, `job_attempts`, `job_results` and `job_events`, with CHECK, UNIQUE and foreign-key constraints and the indexes the Phase 3 scheduler will need.
+- Repository (`JobRepository`) with transactional operations and optimistic concurrency (`version` column): create/get/update job, update state, create attempt, store result, get attempts/results/events.
 - Idempotency key column with unique constraint (storage only; semantics completed in Phase 7).
 - Append-only audit trail in `job_events` written in the same transaction as each transition.
+- Schema documentation in `docs/DATABASE.md`.
 
-**Expected deliverables.** Migrations, repository library, state-machine module, schema documentation in `docs/`.
+**Expected deliverables.** Migrations, domain and repository library, state-machine module, schema documentation.
 
-**Tests/validation.** Unit tests for every legal and illegal transition; integration tests against real PostgreSQL covering CRUD, concurrent transition races, and constraint enforcement.
+**Tests/validation.** Unit tests for every legal and illegal transition and for model validation; integration tests against real PostgreSQL covering CRUD, state-change and attempt/result persistence, constraint enforcement, transaction rollback, concurrent races and migration correctness; Docker/Compose validation of the migrated schema.
 
 **Completion criteria.**
-- All migrations apply cleanly forward on an empty database.
-- Illegal transitions are rejected in code and cannot be produced via repository API.
+- All migrations apply cleanly forward on an empty database and a second run changes nothing.
+- Illegal transitions are rejected in code, rejected by the database, and cannot be produced via the repository API.
+- A failed transaction leaves no partial job state.
 - Concurrency race tests pass reliably.
 - `summary.md` updated and phase commit pushed.
 
@@ -140,9 +142,9 @@ If documents conflict, stop and resolve the conflict before implementing. Archit
 
 **Implementation tasks.**
 - Dependency submission with cycle detection (reject cyclic graphs at submit time).
-- `WAITING` state handling: track unmet dependency count per job.
+- `PENDING` handling for jobs with dependencies: track unmet dependency count per job; add the `job_dependencies` migration.
 - On dependency success, atomically decrement counters and release newly-ready jobs to the scheduler.
-- Failure policy: a failed or cancelled upstream marks downstream jobs `UPSTREAM_FAILED` (or per-job configured policy), recursively.
+- Failure policy: a failed or cancelled upstream fails or cancels downstream jobs per policy (adding the `PENDING`→`FAILED` transition to the state machine), recursively.
 - Support for fan-out, fan-in, and diamond graphs; graph size limits.
 - Graph inspection queries (ancestors, descendants, topological view).
 
@@ -167,7 +169,7 @@ If documents conflict, stop and resolve the conflict before implementing. Archit
 **Scope.** Worker registration, pull-based job acquisition, handler dispatch, result reporting. Lease and failure handling are deferred to Phase 6.
 
 **Implementation tasks.**
-- Worker identity, registration, and deregistration recorded in PostgreSQL.
+- Worker identity, registration, and deregistration recorded in PostgreSQL (adds the `workers` migration).
 - Worker manager tracking capacity and status.
 - Thread-pool executor with configurable concurrency and bounded internal queue (backpressure).
 - Job handler registry (job `type` → handler function).
@@ -200,7 +202,7 @@ If documents conflict, stop and resolve the conflict before implementing. Archit
 - Lease on every claimed job (`lease_owner`, `lease_expires_at`, `lease_token`) persisted in PostgreSQL.
 - Lease renewal tied to worker heartbeats; fencing token checked on every state write so stale workers cannot overwrite results.
 - Worker heartbeat protocol and liveness tracking (Redis TTL keys for fast detection, PostgreSQL for durable record).
-- Failure detector (lease sweeper) that finds expired leases and returns jobs to `QUEUED` (or failure path) atomically.
+- Failure detector (lease sweeper) that finds expired leases and returns jobs to `RETRY_WAIT` (or the failure path) atomically.
 - Worker states: `ACTIVE`, `DRAINING`, `SUSPECT`, `DEAD`.
 - Recovery behavior defined for scheduler restart, worker restart, Redis loss, and PostgreSQL reconnect.
 
@@ -228,7 +230,7 @@ If documents conflict, stop and resolve the conflict before implementing. Archit
 - Per-job retry policy: `max_attempts`, exponential backoff with jitter, retryable vs. non-retryable errors.
 - Retries re-enter the scheduler as delayed jobs; each attempt recorded in `job_attempts`.
 - Execution timeout enforced by the worker with cooperative cancellation, and enforced by the lease sweeper as a backstop.
-- Dead-letter state (`DEAD`) after exhausted retries, with manual requeue.
+- Dead-letter handling: jobs end `FAILED` (or `TIMEOUT`) after exhausted retries, with manual requeue.
 - Idempotent submission: duplicate `idempotency_key` returns the existing job.
 - Idempotency support for handlers: stable `job_id` and `attempt` passed to handlers; documented at-least-once contract.
 - Cancellation of queued and running jobs.

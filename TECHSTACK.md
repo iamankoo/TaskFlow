@@ -13,7 +13,7 @@ Governed by `Phases.md` and `ARCHITECTURE.md`. This list is **locked**. No frame
 | **Docker Compose** | Local/dev/prod-like orchestration | Defines the multi-service topology (API, scheduler, workers, PostgreSQL, Redis) and enables failure-injection testing. |
 | **GoogleTest** | Testing | Mature C++ unit/integration test framework with fixtures, parameterized tests, and CTest integration. |
 | **spdlog** | Logging | Fast, header-friendly, structured and leveled logging with async sinks. |
-| **JSON** | Data interchange | Request/response bodies and job payloads. Implementation uses the JSON facilities provided by Drogon (JsonCpp) at API boundaries; `nlohmann/json` may be used internally only if recorded in `summary.md` as a decision. |
+| **JSON** | Data interchange | Request/response bodies and job payloads (stored as PostgreSQL `jsonb`). Implementation uses the JSON facilities provided by Drogon (JsonCpp) at API boundaries; `nlohmann/json` may be used internally only if recorded in `summary.md` as a decision. |
 | **Prometheus-compatible metrics** | Observability | Text exposition format on `/metrics`, scrapeable by Prometheus and compatible systems; no Prometheus server is required by TaskFlow itself. |
 | **GitHub Actions** | CI | Automated build, test, and sanitizer runs on every push/PR. |
 

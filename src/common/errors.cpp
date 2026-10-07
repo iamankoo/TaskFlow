@@ -10,6 +10,9 @@ std::string_view ToString(ErrorCode code) noexcept {
     case ErrorCode::kRedis: return "redis_error";
     case ErrorCode::kMigration: return "migration_error";
     case ErrorCode::kPoolTimeout: return "pool_timeout";
+    case ErrorCode::kNotFound: return "not_found";
+    case ErrorCode::kConflict: return "conflict";
+    case ErrorCode::kInvalidTransition: return "invalid_transition";
     case ErrorCode::kLifecycle: return "lifecycle_error";
     case ErrorCode::kInternal: return "internal_error";
   }

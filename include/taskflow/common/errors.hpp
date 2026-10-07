@@ -3,6 +3,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <utility>
 
 namespace taskflow {
 
@@ -13,6 +14,9 @@ enum class ErrorCode {
   kRedis,
   kMigration,
   kPoolTimeout,
+  kNotFound,
+  kConflict,
+  kInvalidTransition,
   kLifecycle,
   kInternal,
 };
@@ -37,7 +41,21 @@ class ConfigError : public Error {
 
 class DatabaseError : public Error {
  public:
-  explicit DatabaseError(const std::string& message) : Error(ErrorCode::kDatabase, message) {}
+  explicit DatabaseError(const std::string& message, std::string sqlstate = "",
+                         std::string constraint = "")
+      : Error(ErrorCode::kDatabase, message),
+        sqlstate_(std::move(sqlstate)),
+        constraint_(std::move(constraint)) {}
+
+  // Five-character PostgreSQL SQLSTATE (e.g. "23505" unique_violation); empty for
+  // failures that did not come from the server (connection problems).
+  const std::string& sqlstate() const noexcept { return sqlstate_; }
+  // Name of the violated constraint, when PostgreSQL reports one.
+  const std::string& constraint() const noexcept { return constraint_; }
+
+ private:
+  std::string sqlstate_;
+  std::string constraint_;
 };
 
 class RedisError : public Error {
@@ -54,6 +72,30 @@ class PoolTimeoutError : public Error {
  public:
   explicit PoolTimeoutError(const std::string& message)
       : Error(ErrorCode::kPoolTimeout, message) {}
+};
+
+// Input rejected by domain validation (never reached the database).
+class ValidationError : public Error {
+ public:
+  explicit ValidationError(const std::string& message)
+      : Error(ErrorCode::kInvalidArgument, message) {}
+};
+
+class NotFoundError : public Error {
+ public:
+  explicit NotFoundError(const std::string& message) : Error(ErrorCode::kNotFound, message) {}
+};
+
+// A uniqueness rule or optimistic-concurrency check failed.
+class ConflictError : public Error {
+ public:
+  explicit ConflictError(const std::string& message) : Error(ErrorCode::kConflict, message) {}
+};
+
+class InvalidTransitionError : public Error {
+ public:
+  explicit InvalidTransitionError(const std::string& message)
+      : Error(ErrorCode::kInvalidTransition, message) {}
 };
 
 class LifecycleError : public Error {

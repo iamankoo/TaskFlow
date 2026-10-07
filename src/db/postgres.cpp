@@ -2,6 +2,7 @@
 
 #include <chrono>
 #include <string>
+#include <utility>
 
 #include "taskflow/common/errors.hpp"
 
@@ -66,10 +67,27 @@ PgConnection::~PgConnection() { PQfinish(connection_); }
 
 bool PgConnection::IsHealthy() const { return PQstatus(connection_) == CONNECTION_OK; }
 
+bool PgConnection::EnsureIdle() {
+  if (!IsHealthy()) return false;
+  if (PQtransactionStatus(connection_) == PQTRANS_IDLE) return true;
+  try {
+    Exec("ROLLBACK");
+  } catch (const Error&) {
+    return false;
+  }
+  return PQtransactionStatus(connection_) == PQTRANS_IDLE;
+}
+
 void PgConnection::ThrowLastError(const std::string& context, PGresult* result) const {
   std::string reason = result != nullptr ? Trimmed(PQresultErrorMessage(result)) : "";
   if (reason.empty()) reason = Trimmed(PQerrorMessage(connection_));
-  throw DatabaseError(context + ": " + reason);
+  std::string sqlstate;
+  std::string constraint;
+  if (result != nullptr) {
+    if (const char* state = PQresultErrorField(result, PG_DIAG_SQLSTATE)) sqlstate = state;
+    if (const char* name = PQresultErrorField(result, PG_DIAG_CONSTRAINT_NAME)) constraint = name;
+  }
+  throw DatabaseError(context + ": " + reason, std::move(sqlstate), std::move(constraint));
 }
 
 void PgConnection::Exec(const std::string& sql) {
@@ -80,10 +98,10 @@ void PgConnection::Exec(const std::string& sql) {
   }
 }
 
-PgResult PgConnection::Query(const std::string& sql, const std::vector<std::string>& params) {
+PgResult PgConnection::Query(const std::string& sql, const std::vector<Param>& params) {
   std::vector<const char*> values;
   values.reserve(params.size());
-  for (const auto& p : params) values.push_back(p.c_str());
+  for (const auto& p : params) values.push_back(p ? p->c_str() : nullptr);
 
   ResultPtr result(PQexecParams(connection_, sql.c_str(), static_cast<int>(params.size()), nullptr,
                                 values.empty() ? nullptr : values.data(), nullptr, nullptr, 0));
@@ -114,11 +132,29 @@ PgResult PgConnection::Query(const std::string& sql, const std::vector<std::stri
   return out;
 }
 
+PgTransaction::PgTransaction(PgConnection& connection) : connection_(connection) {
+  connection_.Exec("BEGIN");
+}
+
+PgTransaction::~PgTransaction() {
+  if (!active_) return;
+  try {
+    connection_.Exec("ROLLBACK");
+  } catch (...) {
+    // The pool's EnsureIdle() check discards connections that could not be rolled back.
+  }
+}
+
+void PgTransaction::Commit() {
+  connection_.Exec("COMMIT");
+  active_ = false;
+}
+
 PgPool::PgPool(const PostgresConfig& config)
     : config_(config),
       pool_(
           config.pool_size, [cfg = config] { return PgConnection::Connect(cfg); },
-          [](PgConnection& connection) { return connection.IsHealthy(); },
+          [](PgConnection& connection) { return connection.EnsureIdle(); },
           std::chrono::milliseconds(config.acquire_timeout_ms)) {}
 
 PgPool::Lease PgPool::Acquire() { return pool_.Acquire(); }

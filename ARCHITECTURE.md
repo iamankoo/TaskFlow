@@ -51,46 +51,49 @@ TaskFlow ships as **one C++20 binary with role flags** (`--role=api|scheduler|wo
 
 ## 4. Job Lifecycle
 
-1. **Submit.** API validates the request, applies the idempotency key, and inserts the job (and dependency edges) in one PostgreSQL transaction.
-2. **Initial state** is chosen: `WAITING` (has unmet dependencies), `SCHEDULED` (`run_at` in the future), or `QUEUED` (runnable now).
-3. **Release.** When dependencies succeed (`WAITING`→…) or `run_at` arrives (`SCHEDULED`→`QUEUED`), the job is published to the Redis ready queue.
-4. **Claim.** A worker pulls a job. In one PostgreSQL transaction the job moves `QUEUED`→`LEASED`, a lease with a fencing token is created, and a `job_attempts` row is written.
-5. **Run.** Worker moves the job `LEASED`→`RUNNING` and executes the handler, heartbeating to keep the lease alive.
-6. **Complete.** Worker reports the result with its fencing token. Success → `SUCCEEDED`. Failure → Retry Manager decides: `SCHEDULED` (retry after backoff) or `DEAD` (attempts exhausted / non-retryable).
-7. **Propagate.** On `SUCCEEDED`, the DAG engine releases ready children. On terminal failure, it marks descendants `UPSTREAM_FAILED`.
+1. **Submit.** API validates the request, applies the idempotency key, and inserts the job (and, from Phase 4, its dependency edges) in one PostgreSQL transaction together with its creation event.
+2. **Initial state** is chosen: `PENDING` (`scheduled_at` in the future, or unmet dependencies) or `READY` (runnable now).
+3. **Release.** When `scheduled_at` arrives or dependencies complete, `PENDING`→`READY`, and the job is published to the Redis ready queue.
+4. **Claim.** A worker pulls a job. In one PostgreSQL transaction the job moves `READY`→`RUNNING`, `attempt_count` is incremented, and a `job_attempts` row is written (`JobRepository::CreateAttempt`). From Phase 6 the same transaction also creates the lease with its fencing token.
+5. **Run.** The worker executes the handler, heartbeating to keep the lease alive.
+6. **Complete.** The worker reports the outcome (with its fencing token from Phase 6). In **one transaction** the result is stored, the attempt is closed and the job moves on (`JobRepository::StoreResult`): success → `COMPLETED`; failure or timeout with attempts remaining → `RETRY_WAIT` (`scheduled_at` = now + backoff); failure that is final → `FAILED`; final attempt timed out → `TIMEOUT`.
+7. **Retry.** When `scheduled_at` arrives, `RETRY_WAIT`→`READY` and the cycle repeats from step 4.
+8. **Propagate.** On `COMPLETED`, the DAG engine releases ready children. When a parent ends `FAILED`, `TIMEOUT` or `CANCELLED`, its dependents are failed or cancelled according to policy (Phase 4 adds the required `PENDING`→`FAILED` transition to the table below).
 
 ## 5. Job State Machine
 
-States: `WAITING`, `SCHEDULED`, `QUEUED`, `LEASED`, `RUNNING`, `SUCCEEDED`, `DEAD`, `CANCELLED`, `UPSTREAM_FAILED`.
-Terminal states: `SUCCEEDED`, `DEAD`, `CANCELLED`, `UPSTREAM_FAILED`.
+States: `PENDING`, `READY`, `RUNNING`, `COMPLETED`, `FAILED`, `RETRY_WAIT`, `TIMEOUT`, `CANCELLED`.
+Final states (no automatic transition leaves them): `COMPLETED`, `FAILED`, `TIMEOUT`, `CANCELLED`. `FAILED` and `TIMEOUT` can be requeued manually; `COMPLETED` and `CANCELLED` are permanent.
 
 | From | To | Trigger |
 |------|----|---------|
-| (new) | `WAITING` | Submitted with unmet dependencies |
-| (new) | `SCHEDULED` | Submitted with future `run_at` |
-| (new) | `QUEUED` | Submitted and runnable |
-| `WAITING` | `SCHEDULED` / `QUEUED` | All dependencies succeeded (`SCHEDULED` if `run_at` still future) |
-| `WAITING` | `UPSTREAM_FAILED` | A dependency reached a failure terminal state |
-| `SCHEDULED` | `QUEUED` | `run_at` reached |
-| `QUEUED` | `LEASED` | Worker claims job |
-| `LEASED` | `RUNNING` | Worker starts execution |
-| `LEASED` / `RUNNING` | `SUCCEEDED` | Worker reports success (valid fencing token) |
-| `LEASED` / `RUNNING` | `SCHEDULED` | Attempt failed or lease/timeout expired, attempts remain (backoff applied) |
-| `LEASED` / `RUNNING` | `DEAD` | Attempt failed/expired, attempts exhausted or non-retryable |
-| `DEAD` | `QUEUED` | Manual requeue |
-| `WAITING` / `SCHEDULED` / `QUEUED` / `LEASED` / `RUNNING` | `CANCELLED` | Cancel request |
+| (new) | `PENDING` | Submitted with a future `scheduled_at` (or, from Phase 4, unmet dependencies) |
+| (new) | `READY` | Submitted and runnable now |
+| `PENDING` | `READY` | `scheduled_at` reached / dependencies completed |
+| `PENDING` | `CANCELLED` | Cancel request |
+| `READY` | `RUNNING` | Worker claims the job (creates an attempt) |
+| `READY` | `CANCELLED` | Cancel request |
+| `RUNNING` | `COMPLETED` | Attempt succeeded |
+| `RUNNING` | `RETRY_WAIT` | Attempt failed or timed out and attempts remain |
+| `RUNNING` | `FAILED` | Attempt failed and the failure is final (non-retryable or attempts exhausted) |
+| `RUNNING` | `TIMEOUT` | Final attempt exceeded its timeout |
+| `RUNNING` | `CANCELLED` | Cancel request (the active attempt is closed as cancelled) |
+| `RETRY_WAIT` | `READY` | Backoff elapsed (`scheduled_at` reached) |
+| `RETRY_WAIT` | `CANCELLED` | Cancel request |
+| `FAILED` | `READY` | Manual requeue |
+| `TIMEOUT` | `READY` | Manual requeue |
 
-Any transition not listed is illegal and is rejected by the single transition function. Each transition also writes a `job_events` row in the same transaction.
+These 13 transitions are the only legal ones; everything else (for example `COMPLETED`→`RUNNING`, `CANCELLED`→`RUNNING`, `PENDING`→`RUNNING`, `RETRY_WAIT`→`RUNNING`) is rejected. The table is enforced twice: by the C++ transition function (`src/jobs/job_state.cpp`) and by a PostgreSQL trigger on `jobs` (`migrations/0001_create_jobs.sql`); an integration test compares both for all 56 ordered pairs of distinct states. Each transition also writes a `job_events` row in the same transaction. A requeued job keeps its `attempt_count`; granting more attempts is an explicit edit of its retry policy.
 
 ## 6. Scheduler Architecture
 
 The Scheduler runs a periodic tick (configurable) that is safe to run on multiple instances: all mutations are guarded by PostgreSQL row locks (`FOR UPDATE SKIP LOCKED`) or atomic Redis scripts, so multiple schedulers cooperate rather than conflict.
 
 Each tick:
-1. **Promote delayed jobs** whose `run_at` is due (Redis Lua script, then PostgreSQL transition `SCHEDULED`→`QUEUED`).
+1. **Promote delayed jobs** whose `run_at` is due (Redis Lua script, then PostgreSQL transition `PENDING`→`READY`, or `RETRY_WAIT`→`READY` for retries).
 2. **Release dependency-ready jobs** produced by the DAG engine.
 3. **Sweep expired leases** (via Lease Manager).
-4. **Reconcile**: periodically compare PostgreSQL `QUEUED`/`SCHEDULED` jobs with Redis and repair any divergence (re-enqueue missing, drop stale).
+4. **Reconcile**: periodically compare PostgreSQL `READY`/`PENDING`/`RETRY_WAIT` jobs with Redis and repair any divergence (re-enqueue missing, drop stale).
 5. **Apply aging** to prevent starvation.
 
 ## 7. Priority Scheduling
@@ -102,14 +105,14 @@ Each tick:
 
 ## 8. Delayed Jobs
 
-Delayed jobs (`run_at` in the future, and retry backoffs) live in the PostgreSQL row (`state = SCHEDULED`, `run_at`) as truth, and in a Redis sorted set scored by `run_at` for efficient polling. A Lua script atomically moves due members to the ready queue. If Redis is lost, reconciliation rebuilds the sorted set from PostgreSQL.
+Delayed jobs (`run_at` in the future, and retry backoffs) live in the PostgreSQL row (`state = PENDING`, or `RETRY_WAIT` for backoff, with `scheduled_at`) as truth, and in a Redis sorted set scored by `run_at` for efficient polling. A Lua script atomically moves due members to the ready queue. If Redis is lost, reconciliation rebuilds the sorted set from PostgreSQL.
 
 ## 9. DAG / Dependency Execution
 
 - Dependencies are stored as edges in `job_dependencies (job_id, depends_on_id)`.
 - On submission the graph is validated: **cycles are rejected**, size limits enforced.
-- Each `WAITING` job tracks `unmet_dependencies`. When a parent reaches `SUCCEEDED`, the counter is decremented in a transaction; the transaction that brings it to zero releases the job — **exactly once**, even if parents finish concurrently (guarded by row lock/conditional update).
-- A parent reaching `DEAD`, `CANCELLED`, or `UPSTREAM_FAILED` marks dependents `UPSTREAM_FAILED`, recursively.
+- Each `PENDING` job with dependencies tracks `unmet_dependencies`. When a parent reaches `COMPLETED`, the counter is decremented in a transaction; the transaction that brings it to zero releases the job — **exactly once**, even if parents finish concurrently (guarded by row lock/conditional update).
+- A parent ending `FAILED`, `TIMEOUT` or `CANCELLED` fails or cancels its dependents (per policy), recursively; Phase 4 adds the `PENDING`→`FAILED` transition this needs.
 - Supported shapes: chains, fan-out, fan-in, diamonds.
 
 ## 10. Worker Pool and Registration
@@ -125,12 +128,12 @@ Delayed jobs (`run_at` in the future, and retry backoffs) live in the PostgreSQL
 - **Heartbeat:** each worker periodically heartbeats, renewing the leases of its running jobs and refreshing a Redis TTL key for fast liveness detection. PostgreSQL records `last_heartbeat_at` durably.
 - **Fencing:** every state write by a worker (start, complete, fail, renew) must present its token; the write is rejected if the token is not current. A zombie worker therefore cannot overwrite a newer attempt.
 - **Failure detection:** the lease sweeper finds jobs whose lease expired, and workers with no heartbeat (`ACTIVE`→`SUSPECT`→`DEAD`). Detection bound ≈ lease TTL + sweep interval.
-- **Reclaim:** expired jobs are returned via the Retry Manager (`SCHEDULED`) or `DEAD`, counting as a failed attempt.
+- **Reclaim:** expired jobs are returned via the Retry Manager (`RETRY_WAIT`) or finished as `FAILED`/`TIMEOUT`, counting as a failed attempt.
 
 ## 12. Retries, Timeouts, and Idempotency
 
 - **Retry:** per-job `max_attempts`, exponential backoff with jitter, retryable/non-retryable classification. Retries are delayed jobs. Every attempt is stored in `job_attempts`.
-- **Dead-letter:** exhausted jobs become `DEAD`, retained for inspection and manual requeue.
+- **Dead-letter:** exhausted jobs end `FAILED` (or `TIMEOUT`), retained for inspection and manual requeue.
 - **Timeouts:** each job has an execution timeout. The worker enforces it via cooperative cancellation; the lease sweeper enforces it as a backstop for hung or unreachable workers.
 - **Idempotency (submission):** a unique `idempotency_key` guarantees duplicate submissions return the original job.
 - **Idempotency (execution):** because delivery is at-least-once, handlers receive a stable `job_id` and `attempt` to dedupe external side effects. This contract is documented for handler authors.
@@ -157,7 +160,7 @@ The API (`/api/v1`) is the only external interface. It performs authentication (
 
 | Failure | Recovery |
 |---------|----------|
-| Worker crashes mid-job | Heartbeats stop → lease expires → sweeper reclaims job → retry or `DEAD`. Fencing blocks any late write from the old worker. |
+| Worker crashes mid-job | Heartbeats stop → lease expires → sweeper reclaims job → `RETRY_WAIT` or `FAILED`. Fencing blocks any late write from the old worker. |
 | Worker hangs | Execution timeout (cooperative) then lease expiry backstop. |
 | Scheduler crashes | Stateless; another instance (or restart) resumes. Row locks/conditional updates prevent double-processing. |
 | Redis lost/flushed | Reconciliation rebuilds queues and delayed set from PostgreSQL. |

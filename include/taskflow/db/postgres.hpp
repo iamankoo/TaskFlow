@@ -35,17 +35,44 @@ class PgConnection {
 
   bool IsHealthy() const;
 
+  // Pool hygiene: a connection returned with a transaction still open (for
+  // example after a failed ROLLBACK) must not be handed to the next caller.
+  // Rolls back any open transaction; returns false if the connection is unusable.
+  bool EnsureIdle();
+
   // Runs raw SQL over the simple-query protocol. May contain several statements.
   void Exec(const std::string& sql);
 
+  // A statement parameter: text, or std::nullopt for SQL NULL.
+  using Param = std::optional<std::string>;
+
   // Runs a single parameterized statement ($1, $2, ...). Throws DatabaseError on failure.
-  PgResult Query(const std::string& sql, const std::vector<std::string>& params = {});
+  PgResult Query(const std::string& sql, const std::vector<Param>& params = {});
 
  private:
   explicit PgConnection(PGconn* connection) : connection_(connection) {}
   [[noreturn]] void ThrowLastError(const std::string& context, PGresult* result) const;
 
   PGconn* connection_;
+};
+
+// RAII transaction. Rolls back on destruction unless Commit() succeeded, so an
+// exception thrown anywhere inside the scope can never leave partial changes.
+class PgTransaction {
+ public:
+  explicit PgTransaction(PgConnection& connection);
+  ~PgTransaction();
+  PgTransaction(const PgTransaction&) = delete;
+  PgTransaction& operator=(const PgTransaction&) = delete;
+
+  PgConnection& connection() { return connection_; }
+  PgConnection* operator->() { return &connection_; }
+
+  void Commit();
+
+ private:
+  PgConnection& connection_;
+  bool active_ = true;
 };
 
 class PgPool {

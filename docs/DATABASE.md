@@ -1,0 +1,76 @@
+# TaskFlow database schema (through Phase 2)
+
+PostgreSQL is the durable source of truth (`ARCHITECTURE.md`). Everything below is created by the versioned migrations in `migrations/` and verified by `tests/integration/schema_test.cpp` and `tests/integration/job_repository_test.cpp`. Requires PostgreSQL 13+ (`gen_random_uuid()` is built in); developed and tested on 16.
+
+```
+jobs 1 ──< job_attempts 1 ──0..1 job_results
+ │                                     │
+ ├──< job_events                       └── (job_id, attempt_id) must match the attempt's job
+ └──< job_results
+```
+
+Deleting a job cascades to its attempts, results and events.
+
+## `jobs` (0001)
+
+| Column | Type | Notes |
+|---|---|---|
+| `id` | `uuid` PK | `gen_random_uuid()`; immutable |
+| `sequence` | `bigint` identity, unique | global submission order, the FIFO tie-breaker for the scheduler; cannot be set by clients |
+| `type` | `text` | 1–255 chars; names the handler; immutable |
+| `payload`, `metadata` | `jsonb` | must be JSON objects (CHECK) |
+| `priority` | `smallint` | 0 LOW, 1 NORMAL, 2 HIGH, 3 CRITICAL; descending sort = scheduling order |
+| `status` | `text` | one of the eight states (CHECK) |
+| `scheduled_at` | `timestamptz` | earliest run time; used for delayed jobs and retry backoff |
+| `max_attempts`, `attempt_count` | `integer` | `1..1000`; `0 <= attempt_count <= max_attempts` |
+| `retry_initial_delay_ms`, `retry_backoff_multiplier`, `retry_max_delay_ms` | `integer`, `double precision`, `integer` | the retry policy (applied in Phase 7); `max >= initial`, multiplier `1..100` |
+| `timeout_ms` | `integer` | per-attempt execution timeout, `> 0` (enforced in Phase 7) |
+| `idempotency_key` | `text`, unique | nullable; NULLs never collide; immutable. Storage only in Phase 2 |
+| `last_error` | `text` | message of the most recent failed attempt; cleared on success |
+| `version` | `bigint` | optimistic-concurrency token, incremented by trigger on every update |
+| `created_at`, `updated_at`, `finished_at` | `timestamptz` | `updated_at >= created_at`; `finished_at` is set **exactly** while the status is `COMPLETED`/`FAILED`/`TIMEOUT`/`CANCELLED` (CHECK) |
+
+Triggers:
+
+- `trg_jobs_initial_state` (insert): a job is created `PENDING` or `READY`.
+- `trg_jobs_update_guard` (update): rejects any state change outside the 13-edge transition table (SQLSTATE `TF001`), rejects edits of immutable columns (`TF002`), and maintains `version` and `updated_at`. The table is identical to `src/jobs/job_state.cpp`; a test compares both for every pair of states.
+
+## `job_attempts` (0002)
+
+One row per execution attempt: `attempt_number` (1-based, unique per job), `status` (`RUNNING`, `SUCCEEDED`, `FAILED`, `TIMED_OUT`, `CANCELLED`), `started_at`, `finished_at` (set exactly when not `RUNNING`), `error_message` (only on unsuccessful finished attempts). A partial unique index allows **at most one `RUNNING` attempt per job**, whoever writes. `UNIQUE (id, job_id)` exists so `job_results` can reference the pair.
+
+## `job_results` (0003)
+
+The outcome of one attempt, kept apart from `jobs` so large outputs never bloat the hot table and a result can be read on its own. At most one per attempt (`UNIQUE (attempt_id)`); the composite foreign key `(attempt_id, job_id)` guarantees the attempt belongs to the same job. CHECK: success has `output` (optional) and no error; failure has an error and no output. A JSON `null` output is stored as SQL `NULL`.
+
+## `job_events` (0004)
+
+Append-only audit trail: `from_status` (NULL for the creation event), `to_status`, `reason`, `created_at`. Updates are rejected by trigger (`TF003`); deletes are allowed only so that deleting a job removes its history. Rows are written by `JobRepository` in the same transaction as the change they record.
+
+## Indexes and why
+
+| Index | Definition | Serves |
+|---|---|---|
+| `pk_jobs`, `uq_jobs_sequence`, `uq_jobs_idempotency_key` | constraints | lookup by id; submission order; idempotent submission lookup/uniqueness |
+| `idx_jobs_ready_queue` | `(priority DESC, scheduled_at, sequence) WHERE status = 'READY'` | Phase 3 dequeue (`ORDER BY priority DESC, scheduled_at, sequence LIMIT n` is answered from the index with no sort) and rebuilding Redis after a flush. Partial, so it only costs writes for jobs that are currently runnable |
+| `idx_jobs_due` | `(scheduled_at) WHERE status IN ('PENDING','RETRY_WAIT')` | promoting delayed and backed-off jobs whose time has come |
+| `idx_jobs_created_at` | `(created_at DESC, id)` | newest-first listing for the Phase 8 API |
+| `uq_job_attempts_job_number` | `(job_id, attempt_number)` | attempts of a job in order (also the foreign-key lookup) |
+| `uq_job_attempts_one_running` | `(job_id) WHERE status = 'RUNNING'` | the one-active-attempt invariant |
+| `idx_job_results_job` | `(job_id, id DESC)` | latest result of a job; foreign-key lookup |
+| `idx_job_events_job` | `(job_id, id)` | a job's history; foreign-key lookup |
+
+Deliberately **not** created, to avoid write cost with no demonstrated query: a plain `status` index (low cardinality; the partial indexes above cover the queries that matter, and per-state counts are an aggregate for Phase 8/9), an index on `type`, and a `RUNNING`-job index (Phase 6 adds one together with the lease columns it will query). Phase 9 re-evaluates every index against measured query plans.
+
+Two tests assert the two scheduler-facing indexes are actually chosen by the planner for the queries they are designed for.
+
+## Conventions
+
+- Timestamps are `timestamptz`; the C++ layer exchanges them as exact microseconds since the Unix epoch.
+- `jobs.updated_at` uses `clock_timestamp()` (monotonic per row) so a long-running transaction can never make it earlier than `created_at`.
+- Custom SQLSTATEs: `TF001` illegal state transition or initial state, `TF002` immutable column edit, `TF003` event modification. `JobRepository` maps these and the standard constraint errors (`23505`, `23514`, `23503`) onto domain errors (`InvalidTransitionError`, `ValidationError`, `ConflictError`, `NotFoundError`).
+- A requeued (`FAILED`/`TIMEOUT` → `READY`) job keeps its `attempt_count`. If it has no attempts left, `CreateAttempt` fails with `ConflictError` until its retry policy is edited to allow more.
+
+## Migrations
+
+`NNNN_name.sql`, forward-only, each applied in its own transaction with its `schema_migrations` row. Applied files are checksummed; editing one is detected and refused. See `migrations/README.md`.

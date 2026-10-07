@@ -38,6 +38,9 @@ add_library(taskflow_core STATIC
   src/logging/json_formatter.cpp
   src/db/postgres.cpp
   src/db/migration_runner.cpp
+  src/db/job_repository.cpp
+  src/jobs/job.cpp
+  src/jobs/job_state.cpp
   src/redis/redis_client.cpp
   src/api/health_service.cpp
   src/api/http_server.cpp
