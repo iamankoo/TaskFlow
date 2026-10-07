@@ -1,0 +1,93 @@
+# Development environment: TaskFlow + PostgreSQL + Redis.
+#
+#   docker compose up --build                 start everything
+#   docker compose --profile test run --rm taskflow-test   run the full test suite
+#
+# Credentials below are development-only defaults and can be overridden through
+# a local .env file (see .env.example). Ports are bound to localhost only.
+
+name: taskflow
+
+x-taskflow-env: &taskflow-env
+  TASKFLOW_POSTGRES_HOST: postgres
+  TASKFLOW_POSTGRES_PORT: "5432"
+  TASKFLOW_POSTGRES_USER: ${POSTGRES_USER:-taskflow}
+  TASKFLOW_POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-taskflow_dev}
+  TASKFLOW_POSTGRES_DATABASE: ${POSTGRES_DB:-taskflow}
+  TASKFLOW_REDIS_HOST: redis
+  TASKFLOW_REDIS_PORT: "6379"
+  TASKFLOW_LOG_LEVEL: ${TASKFLOW_LOG_LEVEL:-info}
+  TASKFLOW_LOG_FORMAT: ${TASKFLOW_LOG_FORMAT:-text}
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-taskflow}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-taskflow_dev}
+      POSTGRES_DB: ${POSTGRES_DB:-taskflow}
+    ports:
+      - "127.0.0.1:${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  redis:
+    image: redis:7-alpine
+    # Redis is a rebuildable coordination layer, not the source of truth, so no persistence is configured.
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    ports:
+      - "127.0.0.1:${REDIS_PORT:-6379}:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  taskflow:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+      target: runtime
+    image: taskflow:dev
+    environment:
+      <<: *taskflow-env
+      TASKFLOW_HTTP_HOST: 0.0.0.0
+      TASKFLOW_HTTP_PORT: "8080"
+    ports:
+      - "127.0.0.1:${TASKFLOW_HTTP_PORT:-8080}:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8080/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+    stop_grace_period: 15s
+    restart: unless-stopped
+
+  # Runs unit, integration and HTTP tests against the services above.
+  taskflow-test:
+    profiles: ["test"]
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+      target: test
+    environment:
+      <<: *taskflow-env
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+volumes:
+  pgdata:

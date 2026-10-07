@@ -19,11 +19,11 @@ Governed by `Phases.md` and `ARCHITECTURE.md`. This list is **locked**. No frame
 
 ## Supporting Tooling (non-architectural)
 
-Development aids that do not alter the architecture: `clang-format`, `clang-tidy`, AddressSanitizer / UndefinedBehaviorSanitizer / ThreadSanitizer, and a C++ dependency manager (vcpkg or Conan). The dependency manager choice is made in Phase 1 and recorded in `summary.md`. Load-testing and benchmark tooling in Phase 9 must be recorded in `summary.md` and kept out of the production image.
+Development aids that do not alter the architecture: `clang-format`, `clang-tidy`, AddressSanitizer / UndefinedBehaviorSanitizer / ThreadSanitizer, and a C++ dependency manager (vcpkg or Conan). The dependency manager is **vcpkg in manifest mode** (decided in Phase 1; `vcpkg.json` pins the baseline commit). Load-testing and benchmark tooling in Phase 9 must be recorded in `summary.md` and kept out of the production image.
 
 ## Constraints
 
 - Language standard: C++20 only (no compiler-specific extensions in project code).
 - Compilers targeted: GCC and Clang on Linux (primary, CI and Docker); local Windows development is via Docker/WSL.
-- Database access: PostgreSQL and Redis clients are limited to those compatible with the above (Drogon-provided clients preferred, otherwise `libpq` / `hiredis`), recorded in `summary.md` when selected.
+- Database access: **`libpq`** and **`hiredis`** used directly through small pooled wrappers (decided in Phase 1). Drogon's async DB/Redis clients are bound to its event loops, while the scheduler and workers need blocking, thread-safe access. Drogon is used for HTTP only.
 - No additional message brokers, ORMs, or service frameworks.

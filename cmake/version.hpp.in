@@ -1,0 +1,5 @@
+#pragma once
+
+namespace taskflow {
+inline constexpr const char* kVersion = "@PROJECT_VERSION@";
+}  // namespace taskflow

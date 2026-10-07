@@ -145,7 +145,7 @@ Redis is used for: ready queues per priority, the delayed-job sorted set, worker
 
 ## 15. REST API Boundary
 
-The API (`/api/v1`) is the only external interface. It performs authentication (API key), validation, and translation to core services; it never touches Redis queues or executes jobs directly. Operations: submit job, submit DAG, get/list/filter jobs, cancel, requeue dead, list workers, stats. Operational endpoints: `/healthz` (liveness), `/readyz` (dependencies reachable), `/metrics` (Prometheus format). Workers and scheduler interact with core services directly, not through the REST API.
+The API (`/api/v1`) is the only external interface. It performs authentication (API key), validation, and translation to core services; it never touches Redis queues or executes jobs directly. Operations: submit job, submit DAG, get/list/filter jobs, cancel, requeue dead, list workers, stats. Operational endpoints: `/health` (process liveness, PostgreSQL/Redis connectivity and shutdown state; `200` when healthy, `503` when a dependency is down or the process is shutting down) and `/metrics` (Prometheus format). Workers and scheduler interact with core services directly, not through the REST API.
 
 ## 16. Concurrency Model
 
@@ -161,7 +161,7 @@ The API (`/api/v1`) is the only external interface. It performs authentication (
 | Worker hangs | Execution timeout (cooperative) then lease expiry backstop. |
 | Scheduler crashes | Stateless; another instance (or restart) resumes. Row locks/conditional updates prevent double-processing. |
 | Redis lost/flushed | Reconciliation rebuilds queues and delayed set from PostgreSQL. |
-| PostgreSQL unavailable | Writes fail fast, `/readyz` goes unready, workers stop claiming; in-flight jobs finish locally and report on reconnect (fencing validates). |
+| PostgreSQL unavailable | Writes fail fast, `/health` returns `503` (`degraded`), workers stop claiming; in-flight jobs finish locally and report on reconnect (fencing validates). |
 | API instance crashes | Clients retry using idempotency keys. |
 
 ## 18. Data Consistency Model
@@ -174,7 +174,7 @@ The API (`/api/v1`) is the only external interface. It performs authentication (
 ## 19. Graceful Shutdown
 
 On SIGTERM/SIGINT:
-1. Mark `/readyz` unready; API stops accepting new requests, completes in-flight ones.
+1. `/health` starts returning `503` with status `shutting_down` (kept for a configurable grace period so load balancers drain); API stops accepting new requests, completes in-flight ones.
 2. Scheduler finishes the current tick and stops.
 3. Worker enters `DRAINING`: stops claiming, finishes in-flight jobs up to a deadline, reports results, releases leases of unstarted jobs, deregisters.
 4. Jobs still running at the deadline are left to lease expiry (reclaimed by recovery).
@@ -184,7 +184,7 @@ On SIGTERM/SIGINT:
 
 - **Logging:** spdlog structured logs with job, worker, and request correlation ids.
 - **Metrics (Prometheus-compatible):** queue depth per priority, jobs by state, job latency and queue-wait histograms, worker counts by state, lease expirations, retries, dead-letter count, reconciliation repairs, API request rate/latency/errors.
-- **Health:** `/healthz`, `/readyz`.
+- **Health:** `/health`.
 - **Audit:** `job_events` provides a complete per-job history.
 
 ## 21. Docker Deployment Architecture

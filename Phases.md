@@ -58,7 +58,7 @@ If documents conflict, stop and resolve the conflict before implementing. Archit
 - Multi-stage `Dockerfile`; `docker-compose.yml` with `taskflow`, `postgres`, `redis`.
 - `.clang-format`, `.clang-tidy`, `.gitignore`, `.dockerignore`, `.env.example`.
 - GitHub Actions: configure, build, test, and sanitizer jobs.
-- Minimal `/healthz` endpoint proving the Drogon wiring (liveness only).
+- Minimal `GET /health` endpoint proving the Drogon wiring: reports application availability and PostgreSQL/Redis connectivity (`200` healthy, `503` degraded or shutting down). No job API.
 
 **Expected deliverables.** Building project skeleton, working Compose stack, passing CI, README with build/run instructions.
 
@@ -258,7 +258,7 @@ If documents conflict, stop and resolve the conflict before implementing. Archit
 - Request validation, consistent error model, pagination, and API versioning (`/api/v1`).
 - API-key authentication and request size limits.
 - OpenAPI specification in `docs/`.
-- `/healthz`, `/readyz`, and Prometheus-compatible `/metrics` (queue depth, job state counts, latency histograms, worker counts, lease expirations, retries).
+- `/health` (introduced in Phase 1) and Prometheus-compatible `/metrics` (queue depth, job state counts, latency histograms, worker counts, lease expirations, retries).
 - Structured request/job-correlated logging.
 - Production Docker images and Compose profile (separate `api`, `scheduler`, `worker` roles or a single binary with role flags, as defined in `ARCHITECTURE.md`).
 - Graceful shutdown across all roles.

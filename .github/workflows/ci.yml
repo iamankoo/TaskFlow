@@ -1,0 +1,119 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Must match "builtin-baseline" in vcpkg.json and VCPKG_COMMIT in docker/Dockerfile.
+  VCPKG_COMMIT: 4b308f5ccd45aed57f2977257bca304dfef43c99
+  TASKFLOW_POSTGRES_HOST: localhost
+  TASKFLOW_POSTGRES_USER: taskflow
+  TASKFLOW_POSTGRES_PASSWORD: ci_password
+  TASKFLOW_POSTGRES_DATABASE: taskflow
+  TASKFLOW_REDIS_HOST: localhost
+
+jobs:
+  build-and-test:
+    name: ${{ matrix.preset }} build and tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        preset: [ci, asan]
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: taskflow
+          POSTGRES_PASSWORD: ci_password
+          POSTGRES_DB: taskflow
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U taskflow -d taskflow"
+          --health-interval 3s --health-timeout 3s --health-retries 20
+      redis:
+        image: redis:7-alpine
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 3s --health-timeout 3s --health-retries 20
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Verify the vcpkg pin is consistent
+        run: |
+          grep -q "\"builtin-baseline\": \"${VCPKG_COMMIT}\"" vcpkg.json
+          grep -q "ARG VCPKG_COMMIT=${VCPKG_COMMIT}" docker/Dockerfile
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            autoconf automake bison flex libtool ninja-build pkg-config uuid-dev zip unzip
+
+      - name: Install vcpkg at the pinned commit
+        run: |
+          git init "$RUNNER_TEMP/vcpkg"
+          git -C "$RUNNER_TEMP/vcpkg" remote add origin https://github.com/microsoft/vcpkg.git
+          git -C "$RUNNER_TEMP/vcpkg" fetch --depth 1 origin "$VCPKG_COMMIT"
+          git -C "$RUNNER_TEMP/vcpkg" checkout FETCH_HEAD
+          "$RUNNER_TEMP/vcpkg/bootstrap-vcpkg.sh" -disableMetrics
+          echo "VCPKG_ROOT=$RUNNER_TEMP/vcpkg" >> "$GITHUB_ENV"
+
+      - name: Cache vcpkg binary packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/vcpkg/archives
+          key: vcpkg-${{ runner.os }}-${{ env.VCPKG_COMMIT }}-${{ hashFiles('vcpkg.json') }}
+
+      - name: Work around ASLR incompatibility with sanitizers
+        run: sudo sysctl -w vm.mmap_rnd_bits=28
+
+      - name: Configure
+        run: cmake --preset ${{ matrix.preset }}
+
+      - name: Build
+        run: cmake --build --preset ${{ matrix.preset }}
+
+      - name: Test (unit, integration, HTTP)
+        run: ctest --preset ${{ matrix.preset }}
+
+  docker:
+    name: Docker image and Compose
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Validate Compose file
+        run: docker compose config --quiet
+
+      - name: Build runtime image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile
+          target: runtime
+          load: true
+          tags: taskflow:dev
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Start the stack and check /health
+        run: |
+          docker compose up -d --no-build --wait --wait-timeout 120
+          curl -fsS http://127.0.0.1:8080/health
+          docker compose logs taskflow

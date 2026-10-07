@@ -1,0 +1,14 @@
+{
+  "$schema": "https://raw.githubusercontent.com/microsoft/vcpkg-tool/main/docs/vcpkg.schema.json",
+  "name": "taskflow",
+  "version-string": "0.1.0",
+  "builtin-baseline": "4b308f5ccd45aed57f2977257bca304dfef43c99",
+  "dependencies": [
+    "drogon",
+    "jsoncpp",
+    "spdlog",
+    "libpq",
+    "hiredis",
+    "gtest"
+  ]
+}

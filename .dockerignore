@@ -1,0 +1,10 @@
+.git
+build/
+vcpkg_installed/
+.env
+.env.*
+!.env.example
+*.md
+!migrations/README.md
+docs/
+.github/
