@@ -74,7 +74,9 @@ void Application::Initialize() {
   if (config_.scheduler.enabled) {
     jobs_ = std::make_unique<JobRepository>(*postgres_);
     schedule_queue_ = std::make_unique<ScheduleQueue>(*redis_, config_.scheduler.redis_prefix);
+    dependencies_ = std::make_unique<DependencyService>(*postgres_, *jobs_);
     scheduler_ = std::make_unique<Scheduler>(*jobs_, *schedule_queue_, config_.scheduler);
+    scheduler_->SetDependencyService(dependencies_.get());
   }
 
   http_ = std::make_unique<HttpServer>(config_.http, *health_);

@@ -25,7 +25,8 @@ taskflow_add_tests(taskflow_unit_tests unit
   unit/migration_loader_test.cpp
   unit/job_state_test.cpp
   unit/job_model_test.cpp
-  unit/priority_queue_test.cpp)
+  unit/priority_queue_test.cpp
+  unit/dependency_graph_test.cpp)
 
 taskflow_add_tests(taskflow_integration_tests integration
   integration/postgres_test.cpp
@@ -35,6 +36,9 @@ taskflow_add_tests(taskflow_integration_tests integration
   integration/scheduler_repository_test.cpp
   integration/schedule_queue_test.cpp
   integration/scheduler_test.cpp
+  integration/dependency_schema_test.cpp
+  integration/dependency_service_test.cpp
+  integration/dag_scheduler_test.cpp
   integration/job_repository_test.cpp
   integration/application_test.cpp)
 

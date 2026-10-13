@@ -58,7 +58,7 @@ TaskFlow ships as **one C++20 binary with role flags** (`--role=api|scheduler|wo
 5. **Run.** The worker executes the handler, heartbeating to keep the lease alive.
 6. **Complete.** The worker reports the outcome (with its fencing token from Phase 6). In **one transaction** the result is stored, the attempt is closed and the job moves on (`JobRepository::StoreResult`): success → `COMPLETED`; failure or timeout with attempts remaining → `RETRY_WAIT` (`scheduled_at` = now + backoff); failure that is final → `FAILED`; final attempt timed out → `TIMEOUT`.
 7. **Retry.** When `scheduled_at` arrives, `RETRY_WAIT`→`READY` and the cycle repeats from step 4.
-8. **Propagate.** On `COMPLETED`, the DAG engine releases ready children. When a parent ends `FAILED`, `TIMEOUT` or `CANCELLED`, its dependents are failed or cancelled according to policy (Phase 4 adds the required `PENDING`→`FAILED` transition to the table below).
+8. **Propagate.** A job with prerequisites stays `PENDING` until every prerequisite is `COMPLETED`; the scheduler then promotes it like any other due job. When a prerequisite ends `FAILED` or `TIMEOUT`, its `PENDING` dependents end `FAILED`; when it ends `CANCELLED`, they end `CANCELLED`, transitively, in the same transaction (section 9).
 
 ## 5. Job State Machine
 
@@ -69,8 +69,9 @@ Final states (no automatic transition leaves them): `COMPLETED`, `FAILED`, `TIME
 |------|----|---------|
 | (new) | `PENDING` | Submitted with a future `scheduled_at` (or, from Phase 4, unmet dependencies) |
 | (new) | `READY` | Submitted and runnable now |
-| `PENDING` | `READY` | `scheduled_at` reached / dependencies completed |
-| `PENDING` | `CANCELLED` | Cancel request |
+| `PENDING` | `READY` | `scheduled_at` reached **and** every prerequisite `COMPLETED` |
+| `PENDING` | `CANCELLED` | Cancel request, or a prerequisite was cancelled |
+| `PENDING` | `FAILED` | A prerequisite failed or timed out, so the job can never run |
 | `READY` | `RUNNING` | Worker claims the job (creates an attempt) |
 | `READY` | `CANCELLED` | Cancel request |
 | `RUNNING` | `COMPLETED` | Attempt succeeded |
@@ -83,19 +84,19 @@ Final states (no automatic transition leaves them): `COMPLETED`, `FAILED`, `TIME
 | `FAILED` | `READY` | Manual requeue |
 | `TIMEOUT` | `READY` | Manual requeue |
 
-These 13 transitions are the only legal ones; everything else (for example `COMPLETED`→`RUNNING`, `CANCELLED`→`RUNNING`, `PENDING`→`RUNNING`, `RETRY_WAIT`→`RUNNING`) is rejected. The table is enforced twice: by the C++ transition function (`src/jobs/job_state.cpp`) and by a PostgreSQL trigger on `jobs` (`migrations/0001_create_jobs.sql`); an integration test compares both for all 56 ordered pairs of distinct states. Each transition also writes a `job_events` row in the same transaction. A requeued job keeps its `attempt_count`; granting more attempts is an explicit edit of its retry policy.
+These 14 transitions are the only legal ones; everything else (for example `COMPLETED`→`RUNNING`, `CANCELLED`→`RUNNING`, `PENDING`→`RUNNING`, `RETRY_WAIT`→`RUNNING`) is rejected. The table is enforced twice: by the C++ transition function (`src/jobs/job_state.cpp`) and by a PostgreSQL trigger on `jobs` (`migrations/0001_create_jobs.sql`); an integration test compares both for all 56 ordered pairs of distinct states. Each transition also writes a `job_events` row in the same transaction. No job can become `READY` while a prerequisite is not `COMPLETED`: the same trigger enforces that for every writer (scheduler, operator, stale Redis entry). A requeued job keeps its `attempt_count`; granting more attempts is an explicit edit of its retry policy.
 
 ## 6. Scheduler Architecture
 
 The Scheduler (`docs/SCHEDULER.md`) runs a periodic tick (configurable) that is safe to run on multiple instances: promotion is guarded by PostgreSQL row locks (`FOR UPDATE SKIP LOCKED`), Redis writes are idempotent, and only reconciliation takes a short-lived, TTL-bounded Redis lock. Multiple schedulers cooperate rather than conflict. The scheduler changes job state only by `PENDING`/`RETRY_WAIT` → `READY`.
 
 Each tick:
-1. **Find due jobs** in PostgreSQL (`PENDING`/`RETRY_WAIT` with `scheduled_at <= now`, served by `idx_jobs_due`).
+1. **Find due jobs** in PostgreSQL (`PENDING`/`RETRY_WAIT` with `scheduled_at <= now` and no unmet prerequisite, served by `idx_jobs_due`).
 2. **Decide**: order the candidates with the in-memory priority heap (priority, FIFO, aging) and take the best N.
 3. **Promote** those N to `READY` in one PostgreSQL transaction, with one `job_events` row each.
 4. **Publish** the promoted jobs to the Redis ready queues (one Lua script also removes them from the delayed set).
 5. **Reconcile** periodically, immediately if Redis looks flushed (missing sentinel), or after a Redis error: repair Redis from PostgreSQL (re-enqueue missing, drop stale).
-6. *(later phases)* release dependency-ready jobs (Phase 4) and sweep expired leases (Phase 6).
+6. Periodically end `PENDING` jobs stranded behind a failed prerequisite (a safety net; the normal path already did it). *(Phase 6)* sweep expired leases.
 
 PostgreSQL commits before Redis is touched; a Redis failure never blocks or undoes a promotion.
 
@@ -115,11 +116,15 @@ Redis holds only identifiers and sort keys; PostgreSQL wins every disagreement.
 
 ## 9. DAG / Dependency Execution
 
-- Dependencies are stored as edges in `job_dependencies (job_id, depends_on_id)`.
-- On submission the graph is validated: **cycles are rejected**, size limits enforced.
-- Each `PENDING` job with dependencies tracks `unmet_dependencies`. When a parent reaches `COMPLETED`, the counter is decremented in a transaction; the transaction that brings it to zero releases the job — **exactly once**, even if parents finish concurrently (guarded by row lock/conditional update).
-- A parent ending `FAILED`, `TIMEOUT` or `CANCELLED` fails or cancels its dependents (per policy), recursively; Phase 4 adds the `PENDING`→`FAILED` transition this needs.
-- Supported shapes: chains, fan-out, fan-in, diamonds.
+Detailed design: `docs/DATABASE.md` ("Dependencies").
+
+- **Model.** Dependencies are edges `job_dependencies (job_id, depends_on_id)`: *job waits for depends_on*. The graph must be a DAG. Fan-out, fan-in, diamonds and independent components are all just edge sets. Limits: 1,000 prerequisites per job, 100,000 edges per request, 10,000 jobs per workflow, 500,000 stored edges examined per cycle check.
+- **Submission and cycle safety.** All edges of a request are validated and stored in **one transaction** or not at all. A transaction-scoped PostgreSQL advisory lock serializes every graph-changing transaction across all processes, so two requests that each add half of a cycle cannot both pass the check. The check loads the stored ancestors of the new prerequisites, adds the new edges, and runs an iterative depth-first cycle search (`DependencyGraph`, O(V + E), no recursion); a cycle is rejected with the cycle path. Topological sorting uses Kahn's algorithm, O(V + E).
+- **Readiness is derived, not counted.** A job is releasable when every prerequisite is `COMPLETED`. This is computed from the edges and the prerequisites' actual states, never from a stored counter, so it cannot drift (for example after a manual requeue). Because `COMPLETED` is permanent, the answer only moves from "no" to "yes". A job with prerequisites stays `PENDING`; the scheduler promotes it (when its own `scheduled_at` has also passed) with the normal `FOR UPDATE SKIP LOCKED` transaction, which re-checks the prerequisites under the row lock. That makes the release **exactly once**, however many parents finish simultaneously and however many schedulers run. The database trigger additionally refuses any other route to `READY`.
+- **Failure propagation (policy).** When a job ends `FAILED`, `TIMEOUT` or `CANCELLED`, the transaction that makes the transition also ends every `PENDING` job that transitively waits for it: prerequisite `FAILED`/`TIMEOUT` → dependent `FAILED` (`PENDING`→`FAILED`); prerequisite `CANCELLED` → dependent `CANCELLED`. One `job_events` row per job records the reason ("prerequisite <id> failed"). A retryable failure (`RETRY_WAIT`) does **not** propagate: the prerequisite may still succeed. Dependents that are no longer `PENDING` are left alone. Adding an edge to an already failed prerequisite ends the new dependent immediately.
+- **Manual requeue.** Requeuing a failed prerequisite never resurrects its ended dependents, and they cannot be requeued until every prerequisite has actually completed (the trigger refuses `READY` otherwise).
+- **Safety net.** `DependencyService::ResolveBlocked` finds `PENDING` jobs behind an already ended prerequisite (for example after a manual database edit) and ends them; the scheduler runs it with its periodic pass.
+- Supported shapes: chains, fan-out, fan-in, diamonds, layered graphs.
 
 ## 10. Worker Pool and Registration
 

@@ -233,7 +233,7 @@ TEST_F(JobRepositoryTest, IllegalTransitionsAreRejectedAndChangeNothing) {
   const Job job = repo_->CreateJob(Basic());  // PENDING
   const auto version_before = job.version;
   EXPECT_THROW(repo_->UpdateJobState(job.id, JobState::kCompleted), InvalidTransitionError);
-  EXPECT_THROW(repo_->UpdateJobState(job.id, JobState::kFailed), InvalidTransitionError);
+  EXPECT_THROW(repo_->UpdateJobState(job.id, JobState::kRetryWait), InvalidTransitionError);
   EXPECT_THROW(repo_->UpdateJobState(job.id, JobState::kPending), InvalidTransitionError);
 
   const Job after = *repo_->GetJob(job.id);

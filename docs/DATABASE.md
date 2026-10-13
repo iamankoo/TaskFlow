@@ -1,4 +1,4 @@
-# TaskFlow database schema (through Phase 2)
+# TaskFlow database schema (through Phase 4)
 
 PostgreSQL is the durable source of truth (`ARCHITECTURE.md`). Everything below is created by the versioned migrations in `migrations/` and verified by `tests/integration/schema_test.cpp` and `tests/integration/job_repository_test.cpp`. Requires PostgreSQL 13+ (`gen_random_uuid()` is built in); developed and tested on 16.
 
@@ -33,7 +33,7 @@ Deleting a job cascades to its attempts, results and events.
 Triggers:
 
 - `trg_jobs_initial_state` (insert): a job is created `PENDING` or `READY`.
-- `trg_jobs_update_guard` (update): rejects any state change outside the 13-edge transition table (SQLSTATE `TF001`), rejects edits of immutable columns (`TF002`), and maintains `version` and `updated_at`. The table is identical to `src/jobs/job_state.cpp`; a test compares both for every pair of states.
+- `trg_jobs_update_guard` (update): rejects any state change outside the 14-edge transition table (SQLSTATE `TF001`; `PENDING`→`FAILED` was added in migration 0005), refuses `READY` while a prerequisite is not `COMPLETED` (`TF004`), rejects edits of immutable columns (`TF002`), and maintains `version` and `updated_at`. The table is identical to `src/jobs/job_state.cpp`; a test compares both for every pair of states.
 
 ## `job_attempts` (0002)
 
@@ -64,14 +64,51 @@ Deliberately **not** created, to avoid write cost with no demonstrated query: a 
 
 Two tests assert the two scheduler-facing indexes are actually chosen by the planner for the queries they are designed for.
 
+## Dependencies (Phase 4, migration 0005)
+
+```
+jobs 1 ──< job_dependencies >── 1 jobs      (job_id waits for depends_on_id)
+```
+
+`job_dependencies (job_id, depends_on_id, created_at)`
+
+| Rule | Mechanism |
+|---|---|
+| both ends must be jobs | foreign keys `fk_job_dependencies_job`, `fk_job_dependencies_prerequisite` |
+| no self-dependency | `ck_job_dependencies_no_self` |
+| no duplicate edge | primary key `(job_id, depends_on_id)` (also the "prerequisites of a job" index) |
+| deleting a dependent removes its edges | `ON DELETE CASCADE` on `job_id` |
+| a job others wait for cannot be deleted | foreign key on `depends_on_id`, `DEFERRABLE INITIALLY DEFERRED` (checked at COMMIT: a plain `NO ACTION` check can run before the cascade from a dependent has removed its edge, which would make deleting a whole workflow in one statement fail depending on row order) |
+| edges only on a `PENDING` dependent | trigger `trg_job_dependencies_guard` (`TF004`) |
+| edges are immutable | same trigger (`TF003` on update) |
+| **no cycles** | not a constraint (PostgreSQL cannot express it); enforced by `DependencyService` under a global advisory lock, see below |
+
+Indexes: `pk_job_dependencies (job_id, depends_on_id)` serves "prerequisites of job X" and the readiness check; `idx_job_dependencies_prerequisite (depends_on_id, job_id)` serves "dependents of job X" (failure propagation, descendants). A test asserts the planner uses each for its query.
+
+**Readiness check.** In the trigger: `EXISTS (SELECT 1 FROM job_dependencies d JOIN jobs p ON p.id = d.depends_on_id WHERE d.job_id = NEW.id AND p.status <> 'COMPLETED')`, a lookup for one known job. In the scheduler queries, which test many candidate rows, the same rule is written as `NOT EXISTS (SELECT 1 FROM job_dependencies d WHERE d.job_id = jobs.id AND (SELECT p.status FROM jobs p WHERE p.id = d.depends_on_id) <> 'COMPLETED' OFFSET 0)`. The form is deliberate. `OFFSET 0` stops PostgreSQL from flattening the subquery into an anti-join (`LIMIT 1` does not work: PostgreSQL removes it from `EXISTS`), and fetching the status with a scalar primary-key lookup leaves no join method to choose badly. An earlier draft with a plain join was measured: when `job_dependencies` had no statistics (a fresh deployment) PostgreSQL could plan it as a hash join over the whole `jobs` table. Measured cost of the shipped form: about 3 to 5 microseconds per candidate row (`EXPLAIN ANALYZE`, 5,000 candidate rows: 6 ms without the filter, 19 to 32 ms with it, whether or not `job_dependencies` is analyzed and whether it holds 0 or 10,000 edges), i.e. it follows the number of candidates, not the table size. No counter column exists. A test asserts the plan (correlated sub-plan, primary-key lookups, no anti-join, no hash) both before and after `ANALYZE`.
+
+**Trigger replaced.** Migration 0005 replaces `taskflow_guard_job_update()` (`CREATE OR REPLACE`; migration 0001 is untouched, as migrations are never edited after being applied): the transition table gains `('PENDING','FAILED')`, and a transition to `READY` is refused while any prerequisite is not `COMPLETED`. Everything else in the function is identical (immutable columns, version and `updated_at`).
+
+**Upgrade and rollback.** 0005 adds one table and replaces one function; it changes no existing row, so a database that already applied 0001–0004 upgrades in place (tested with data present) and a fresh database reaches the same schema in one run. Migrations are forward-only; to undo 0005 write a new migration that drops `job_dependencies` (after removing its rows), drops its trigger function, and restores the previous `taskflow_guard_job_update()` body from 0001.
+
+### Concurrency
+
+*Cycle safety.* `AddDependencies` and `CreateWorkflow` run in one transaction that begins with `pg_advisory_xact_lock(727275)`. The lock is transaction-scoped, so it works across all application instances and is released at COMMIT/ROLLBACK, including after a crash (no stale lock). Everything that could create a cycle holds it while it (1) locks the involved jobs `FOR UPDATE` in ascending id order, (2) loads the stored ancestors of the new prerequisites (recursive CTE), (3) checks the union with the new edges for a cycle, and (4) inserts. Two opposite edges `X→Y` and `Y→X` are therefore strictly ordered: the second sees the first's committed edge and is refused with `CycleError`. This serializes graph *writes* only; reads, scheduling and job execution never take the lock. The cost is that dependency submission throughput is bounded by one transaction at a time (measured: `docs/benchmarks/dag-phase4.md`). Isolation level is READ COMMITTED; correctness comes from the lock, not from SERIALIZABLE.
+
+*Failure racing with submission.* Adding an edge locks the prerequisite row, and a state change of the prerequisite takes the same row lock. If the prerequisite fails first, the new dependent is ended immediately in the submitting transaction; if the edge commits first, the failing transaction sees it and propagates. Either way a dependent is never stranded `PENDING`.
+
+*Deadlocks and serialization failures.* Multi-row locks are taken in ascending id order, but a propagation (parent then child) and a submission can still lock in opposite orders. PostgreSQL then aborts one transaction with SQLSTATE `40P01` (or `40001`); every repository and service transaction retries up to five times with randomized, growing backoff (`RetryOnConflict`) before surfacing the error. The aborted attempt was fully rolled back.
+
+*Release.* Promotion uses `FOR UPDATE SKIP LOCKED` and re-checks due time and prerequisites under the lock, so a job is released by exactly one scheduler; the trigger is the last line of defence.
+
 ## Scheduler queries (Phase 3)
 
 No schema change was needed: the Phase 2 indexes were designed for these queries, and tests assert the planner uses them.
 
 | Query (`JobRepository`) | Index | Notes |
 |---|---|---|
-| `FindDueJobs` — `status IN ('PENDING','RETRY_WAIT') AND priority = p AND scheduled_at <= now ORDER BY scheduled_at, sequence LIMIT n` (once per priority) | `idx_jobs_due` | oldest first; no payload columns are read |
-| `PromoteJobsToReady` — `SELECT … WHERE id = ANY($1) AND status IN (…) AND scheduled_at <= now FOR UPDATE SKIP LOCKED`, `UPDATE … SET status = 'READY'`, `INSERT INTO job_events`, in one statement/transaction | primary key | `SKIP LOCKED` is what makes concurrent schedulers safe; the status/time predicate is re-checked under the lock |
+| `FindDueJobs` — `status IN ('PENDING','RETRY_WAIT') AND priority = p AND scheduled_at <= now AND NOT EXISTS (unmet prerequisite) ORDER BY scheduled_at, sequence LIMIT n` (once per priority) | `idx_jobs_due` | oldest first; no payload columns are read; blocked jobs never fill the window |
+| `PromoteJobsToReady` — `SELECT … WHERE id = ANY($1) AND status IN (…) AND scheduled_at <= now AND NOT EXISTS (unmet prerequisite) FOR UPDATE SKIP LOCKED`, `UPDATE … SET status = 'READY'`, `INSERT INTO job_events`, in one statement/transaction | primary key | `SKIP LOCKED` is what makes concurrent schedulers safe; the status/time predicate is re-checked under the lock |
 | `FindReadyJobs` — `status = 'READY' AND priority = p AND (scheduled_at, sequence) > cursor ORDER BY scheduled_at, sequence LIMIT n` | `idx_jobs_ready_queue` | keyset pagination for reconciliation |
 | `FindWaitingJobs` — `status IN ('PENDING','RETRY_WAIT') AND (scheduled_at, sequence) > cursor …` | `idx_jobs_due` | keyset pagination for reconciliation |
 | `GetSchedulingEntries` — `WHERE id = ANY($1)` | primary key | verifies stale Redis entries before removal |

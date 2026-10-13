@@ -5,6 +5,7 @@
 #include <memory>
 
 #include "taskflow/api/health_service.hpp"
+#include "taskflow/dag/dependency_service.hpp"
 #include "taskflow/api/http_server.hpp"
 #include "taskflow/config/config.hpp"
 #include "taskflow/db/job_repository.hpp"
@@ -63,6 +64,7 @@ class Application {
   std::unique_ptr<RedisClient> redis_;
   std::unique_ptr<HealthService> health_;
   std::unique_ptr<JobRepository> jobs_;
+  std::unique_ptr<DependencyService> dependencies_;
   std::unique_ptr<ScheduleQueue> schedule_queue_;
   std::unique_ptr<Scheduler> scheduler_;
   std::unique_ptr<HttpServer> http_;

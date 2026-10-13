@@ -10,7 +10,7 @@ namespace taskflow {
 // source of truth; the database enforces the same table with a trigger
 // (migration 0001) and an integration test proves the two never drift apart.
 enum class JobState {
-  kPending,    // accepted, not yet runnable (future scheduled_at; dependencies arrive in Phase 4)
+  kPending,    // accepted, not yet runnable (future scheduled_at or unmet prerequisites)
   kReady,      // runnable now; waiting for a worker
   kRunning,    // claimed by a worker and executing
   kCompleted,  // finished successfully (terminal)

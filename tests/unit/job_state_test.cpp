@@ -15,7 +15,7 @@ using S = JobState;
 // production table drifts, this test (and the database parity test) fails.
 const std::set<std::pair<JobState, JobState>>& ExpectedTransitions() {
   static const std::set<std::pair<JobState, JobState>> expected = {
-      {S::kPending, S::kReady},      {S::kPending, S::kCancelled},
+      {S::kPending, S::kReady},      {S::kPending, S::kCancelled}, {S::kPending, S::kFailed},
       {S::kReady, S::kRunning},      {S::kReady, S::kCancelled},
       {S::kRunning, S::kCompleted},  {S::kRunning, S::kFailed},
       {S::kRunning, S::kRetryWait},  {S::kRunning, S::kTimeout},

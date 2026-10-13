@@ -45,6 +45,10 @@ class JobRepository {
   // ConflictError if the idempotency key is already used.
   Job CreateJob(const NewJob& job);
 
+  // Same insert, but on a connection that is already inside a transaction the caller owns and
+  // commits (used to create a whole workflow atomically). Writes the creation event too.
+  Job CreateJobInTransaction(PgConnection& connection, const NewJob& job);
+
   std::optional<Job> GetJob(const JobId& id);
   std::optional<Job> FindJobByIdempotencyKey(std::string_view key);
 
@@ -83,12 +87,12 @@ class JobRepository {
   // ----- scheduler persistence (Phase 3). Retrieval and persistence only: the
   // scheduling decisions live in Scheduler. These never load payloads. -----
 
-  // Jobs that are PENDING or RETRY_WAIT with scheduled_at <= now, up to `limit_per_priority`
-  // per priority, oldest first. Served by idx_jobs_due.
+  // Jobs that are PENDING or RETRY_WAIT with scheduled_at <= now and no unmet prerequisite (every
+  // prerequisite COMPLETED), up to `limit_per_priority` per priority, oldest first. Served by idx_jobs_due.
   std::vector<SchedulingEntry> FindDueJobs(TimePoint now, std::size_t limit_per_priority);
 
   // Moves the given jobs PENDING/RETRY_WAIT -> READY in ONE transaction, but only those that
-  // are still waiting and due at `now`. Rows another scheduler holds locked are skipped
+  // are still waiting, due at `now` and have no unmet prerequisite (re-checked under the row lock). Rows another scheduler holds locked are skipped
   // (FOR UPDATE SKIP LOCKED), so concurrent schedulers never promote a job twice. Writes one
   // job_events row per promotion. Returns the promoted jobs, in the order of `ids`.
   std::vector<SchedulingEntry> PromoteJobsToReady(const std::vector<JobId>& ids, TimePoint now);

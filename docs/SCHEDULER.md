@@ -19,10 +19,11 @@ The HTTP layer and the repository contain no scheduling logic. The repository on
 ## One tick
 
 ```
-1. FindDueJobs(now)            PostgreSQL, idx_jobs_due: PENDING/RETRY_WAIT with scheduled_at <= now,
-                               up to candidates_per_priority per priority, oldest first
+1. FindDueJobs(now)            PostgreSQL, idx_jobs_due: PENDING/RETRY_WAIT with scheduled_at <= now and no unmet
+                               prerequisite, up to candidates_per_priority per priority, oldest first
 2. heap = JobPriorityQueue     push every candidate; pop the best max_promotions_per_tick
-3. PromoteJobsToReady(ids)     ONE transaction: lock rows (FOR UPDATE SKIP LOCKED), PENDING/RETRY_WAIT -> READY,
+3. PromoteJobsToReady(ids)     ONE transaction: lock rows (FOR UPDATE SKIP LOCKED), re-check due + prerequisites,
+                               PENDING/RETRY_WAIT -> READY,
                                one job_events row each; rows another scheduler holds are skipped
 4. MarkReady(promoted)         Redis, one Lua script: ZREM from delayed + ZADD to the priority's ready queue
 5. Reconcile (if due)          every reconcile_interval_ticks, on a missing sentinel, or after a Redis error
@@ -101,6 +102,15 @@ Any number of scheduler instances can run on the same database:
 
 Test: 5 schedulers in 5 threads work the same 100 due jobs with small batches: 100 promotions, 100 `READY` events (one per job), every row at version 2, zero other states, and Redis converges to exactly the 100.
 
+## Dependencies (Phase 4)
+
+The scheduler needed one rule for DAGs: **a job with an unmet prerequisite is not a candidate and cannot be promoted.** Both `FindDueJobs` and `PromoteJobsToReady` add `AND NOT EXISTS (… a prerequisite whose status <> 'COMPLETED')`; the promotion re-checks it under the row lock, and the database trigger refuses `READY` otherwise. Consequences:
+
+- The priority queue, aging, Redis structures and reconciliation are unchanged. Blocked jobs are simply `PENDING`, so reconciliation lists them in the delayed set and never in a ready queue; a forged ready entry for a blocked job is removed because PostgreSQL says `PENDING`.
+- Blocked jobs cannot crowd out runnable ones: they are filtered in SQL, before the `candidates_per_priority` window.
+- A job released by its last prerequisite is promoted on the next tick (latency ≤ `tick_interval_ms`), by exactly one scheduler.
+- Failure propagation does not involve the scheduler: it happens in the transaction that ends the prerequisite. The scheduler only runs the periodic safety net (`DependencyService::ResolveBlocked`) for jobs stranded by changes made outside the repository.
+
 ## Configuration
 
 `scheduler.*` (JSON) or `TASKFLOW_SCHEDULER_*` (environment); see `.env.example`: `enabled`, `tick_interval_ms` (1000), `max_promotions_per_tick` (500), `candidates_per_priority` (500), `aging_interval_ms` (60000; 0 = off), `reconcile_interval_ticks` (10), `scan_batch_size` (500), `lock_ttl_ms` (10000), `redis_prefix` (`taskflow`). The application starts the scheduler after the HTTP listener setup and stops it (finishing the current tick) when the server stops.
@@ -109,4 +119,4 @@ Test: 5 schedulers in 5 threads work the same 100 due jobs with small batches: 1
 
 - Reconciliation holds the full expected and actual sets in memory (a few hundred bytes per job); fine to hundreds of thousands of jobs, to be streamed in Phase 9 if measurements demand it.
 - Candidate selection reads at most `candidates_per_priority` due jobs per priority per tick, oldest first. A backlog larger than that is drained over several ticks; within the window the heap order is exact.
-- Dependencies (Phase 4), leases (Phase 6) and retry policy (Phase 7) are not part of the scheduler yet.
+- Leases (Phase 6) and retry policy (Phase 7) are not part of the scheduler yet.

@@ -8,19 +8,20 @@ TaskFlow is a distributed job execution platform in C++20: REST API, priority sc
 
 ## Current Status
 
-**Phases 1, 2 and 3 complete.** TaskFlow persists jobs durably (Phase 2) and now has a scheduler that decides which persisted job becomes runnable next: delayed jobs are held until their time, due jobs are promoted `PENDING`/`RETRY_WAIT` → `READY` in priority order (FIFO within a priority, with starvation-preventing aging) and queued in Redis, and Redis is rebuilt from PostgreSQL after any loss. 259 tests pass (also under ASan + UBSan, and the scheduler tests under ThreadSanitizer) against real PostgreSQL and Redis; the Compose stack was built and validated live in GitHub Codespaces.
+**Phases 1–4 complete.** TaskFlow persists jobs (Phase 2), schedules them by priority and time with Redis queues rebuilt from PostgreSQL (Phase 3), and now supports **dependency graphs (DAGs)**: jobs can wait for other jobs, cycles are rejected even under concurrent submission, a job is released exactly once and only when every prerequisite has `COMPLETED`, and a failed or cancelled prerequisite ends its dependents instead of leaving them stuck. 340 tests pass (also under ASan + UBSan, and the concurrency tests under ThreadSanitizer) against real PostgreSQL and Redis; the Compose stack was built and validated live in GitHub Codespaces.
 
 Nothing executes jobs yet and there is no job API: the running server exposes only `GET /health`.
 
 ## Current Phase
 
-None in progress. Phase 4 starts only on the owner's instruction.
+None in progress. Phase 5 starts only on the owner's instruction.
 
 ## Completed Phases
 
 - **Phase 1 — Foundation & Project Infrastructure.** Commit `75e2548`.
 - **Phase 2 — Job Model & Persistent State.** Commit `c523e2e`.
-- **Phase 3 — Scheduler & Priority Queue.** Commit hash: reported in the Phase 3 completion report and recorded here by the first commit of Phase 4 (a commit cannot contain its own hash).
+- **Phase 3 — Scheduler & Priority Queue.** Commit `6227a7a` (`6227a7a35004ca5746e5f35e16e7f9b48ab7d3e7`).
+- **Phase 4 — DAG Dependency Engine.** Commit hash: reported in the Phase 4 completion report and recorded here by the first commit of Phase 5 (a commit cannot contain its own hash).
 
 ## Phase-by-Phase Summary
 
@@ -28,8 +29,8 @@ None in progress. Phase 4 starts only on the owner's instruction.
 |---|-------|--------|--------|
 | 1 | Foundation & Project Infrastructure | **COMPLETE** | `75e2548` |
 | 2 | Job Model & Persistent State | **COMPLETE** | `c523e2e` |
-| 3 | Scheduler & Priority Queue | **COMPLETE** | see Git Commit History |
-| 4 | DAG Dependency Engine | NOT STARTED | — |
+| 3 | Scheduler & Priority Queue | **COMPLETE** | `6227a7a` |
+| 4 | DAG Dependency Engine | **COMPLETE** | see Git Commit History |
 | 5 | Concurrent Worker Pool | NOT STARTED | — |
 | 6 | Job Leasing, Heartbeats & Failure Recovery | NOT STARTED | — |
 | 7 | Retries, Timeouts & Idempotency | NOT STARTED | — |
@@ -37,54 +38,47 @@ None in progress. Phase 4 starts only on the owner's instruction.
 | 9 | Testing, Load Testing & Performance Engineering | NOT STARTED | — |
 | 10 | Final Hardening, Benchmark & Release (FINAL) | NOT STARTED | — |
 
-### Phase 1 (summary)
+### Phases 1–3 (summary)
 
-Build system (CMake presets, vcpkg manifest), configuration, logging, error types, PostgreSQL and Redis connection pools, migration runner, Drogon HTTP server with `GET /health`, graceful lifecycle, Docker/Compose, GitHub Actions CI. CI run on GitHub: green on all three jobs.
+- **Phase 1:** build system (CMake presets, vcpkg manifest), configuration, logging, error types, PostgreSQL and Redis pools, migration runner, Drogon server with `GET /health`, lifecycle, Docker/Compose, GitHub Actions CI.
+- **Phase 2:** job domain model, the eight-state machine (enforced in C++ and by a PostgreSQL trigger, with a parity test), schema `jobs`/`job_attempts`/`job_results`/`job_events`, transactional `JobRepository`, idempotency-key storage. See `docs/DATABASE.md`.
+- **Phase 3:** scheduler (heap-ordered promotion, delayed jobs, aging), Redis ready/delayed sorted sets with an atomic Lua dequeue, PostgreSQL→Redis reconciliation, multi-scheduler safety via `FOR UPDATE SKIP LOCKED`. See `docs/SCHEDULER.md`.
+- CI on GitHub was green on all three jobs for the Phase 1, 2 and 3 commits.
 
-### Phase 2 (summary)
+### Phase 4 detail
 
-Job domain model (`Job`, `NewJob`, `JobId`, `RetryPolicy`, attempts, results, events), the eight-state machine (`PENDING`, `READY`, `RUNNING`, `COMPLETED`, `FAILED`, `RETRY_WAIT`, `TIMEOUT`, `CANCELLED`; 13 legal transitions) enforced both in C++ and by a PostgreSQL trigger with a parity test, schema (`jobs`, `job_attempts`, `job_results`, `job_events`) with CHECK/UNIQUE/foreign-key constraints and scheduler-ready indexes, transactional `JobRepository`, idempotency-key storage. Details: `docs/DATABASE.md`. CI run on GitHub: green on all three jobs.
+**Objective.** A durable, dependency-aware DAG: a job with prerequisites does not become `READY` until all of them succeed; independent jobs stay independently schedulable; cycles are rejected; dependencies survive restarts; resolution is safe under concurrent submission and several schedulers; failed prerequisites have a defined outcome.
 
-### Phase 3 detail
+**Dependency schema (migration `0005_create_job_dependencies.sql`).** `job_dependencies (job_id, depends_on_id, created_at)`: primary key `(job_id, depends_on_id)` (rejects duplicate edges and serves "prerequisites of a job"), foreign keys to `jobs` (`ON DELETE CASCADE` on the dependent; the prerequisite key is `DEFERRABLE INITIALLY DEFERRED` so a prerequisite cannot be deleted from under its dependents but a whole workflow can be deleted at once), `CHECK (job_id <> depends_on_id)`, `idx_job_dependencies_prerequisite (depends_on_id, job_id)` for dependents. Trigger `trg_job_dependencies_guard`: edges can only be added to a `PENDING` job and are immutable. The migration also **replaces** the Phase 2 trigger function `taskflow_guard_job_update()` (migrations 0001–0004 are untouched): it adds the `PENDING→FAILED` transition and refuses `READY` while any prerequisite is not `COMPLETED`. It adds one table and replaces one function, changing no existing row, so a Phase 3 database upgrades in place (tested with data present) and a fresh database reaches the same schema in one run. Forward-only; undo is documented in `docs/DATABASE.md`.
 
-**Objective.** Determine which persisted job should become executable next, by priority and scheduling time: scheduler, priority queue, delayed jobs, ready-job promotion, aging, Redis scheduling structures and PostgreSQL↔Redis reconciliation. Design and rationale: `docs/SCHEDULER.md`.
+**State-machine change.** `PENDING → FAILED` added (now 14 legal transitions), in the C++ table (`job_state.cpp`), the trigger (0005) and the tests (the C++/database parity test covers all 56 pairs, and the explicit expected-transition table gained the edge). No other transition changed.
 
-**Scheduler** (`include/taskflow/scheduler/`, `src/scheduler/`). One `Tick()`: (1) read due `PENDING`/`RETRY_WAIT` jobs from PostgreSQL via `idx_jobs_due`, (2) order them with the in-memory priority heap and take the best `max_promotions_per_tick`, (3) promote them to `READY` in one transaction with `FOR UPDATE SKIP LOCKED` and one `job_events` row each, (4) publish them to the Redis ready queues, (5) reconcile Redis if due. `Start()`/`Stop()` run the loop on a thread that waits on a condition variable (no busy loop) and stops promptly. The scheduler is independent of HTTP and the repository (which only retrieves and persists), takes an injectable clock for deterministic tests, and is started by `Application` when `scheduler.enabled` (default true). A Redis failure never blocks or undoes a promotion; it is reported in the tick result and repaired by the next reconciliation.
+**Graph algorithms** (`DependencyGraph`, pure domain code, no I/O): iterative depth-first cycle search returning the cycle path, Kahn's algorithm for topological order, breadth-first ancestors/descendants, all with explicit stacks/queues (a 200,000-job chain is tested). **O(V + E)**: cycle check and topological sort do work linear in nodes plus edges (hash-map lookups counted as O(1) expected; order is deterministic by insertion). Measured: 16–32 ns per edge across 100,000 to 297,000 edges. Limits: 1,000 prerequisites per job, 100,000 edges per request, 10,000 jobs per workflow, 500,000 stored edges examined per cycle check.
 
-**Priority queue.** `JobPriorityQueue`: indexed binary min-heap, one entry per job (duplicate pushes replace and re-sort), `Push`/`Pop`/`Remove` O(log n), `Top`/`Contains` O(1), `RemoveIf` O(n) for stale entries. Ordering is defined once in `PriorityPolicy`.
+**Application/domain interfaces** (`DependencyService`, SQL in `db/dependency_sql`, none in HTTP): `AddDependencies`, `CreateWorkflow` (jobs + edges atomically), `ValidateEdges`, `Prerequisites`, `Dependents`, `Ancestors`, `Descendants`, `TopologicalView`, `ArePrerequisitesCompleted`, `UnmetPrerequisites`, `ResolveDependents`, `ResolveBlocked`. No REST API (Phase 8).
 
-**Priority levels and FIFO.** `CRITICAL` > `HIGH` > `NORMAL` > `LOW`; the numeric mapping exists in one function and everything else iterates `kPrioritiesHighestFirst`. Equal priority: earlier `scheduled_at`, then lower `sequence` (Phase 2 submission order), so `#10 → #11 → #12`.
+**Readiness semantics.** A job with prerequisites stays `PENDING`; it is promotable when every prerequisite is `COMPLETED` **and** its own `scheduled_at` has passed. Readiness is **derived from the prerequisites' real states, not from a stored counter** (a counter can drift after a manual requeue; because `COMPLETED` is permanent the derived answer only ever goes from no to yes). The scheduler's due-job and promotion queries exclude blocked jobs (so blocked jobs cannot crowd out runnable ones) and the promotion re-checks under the `SKIP LOCKED` row lock, which makes the release exactly-once however many parents finish together and however many schedulers run; the database trigger refuses any other route to `READY` (operator, stale Redis entry, future code). The priority queue, aging and Redis design are unchanged.
 
-**Delayed jobs.** A job with `scheduled_at > now` is never promoted; due means `scheduled_at <= now` (exact to the microsecond; tested one microsecond before and at the boundary). Due jobs are found with the Phase 2 `idx_jobs_due` index (a test asserts the planner uses it); there is no polling of every row. Retry-backoff jobs (`RETRY_WAIT`) are promoted the same way.
+**Failure propagation (policy).** In the same transaction as the transition, every `PENDING` job that transitively waits for a job that ended `FAILED` or `TIMEOUT` ends `FAILED`; one that waits for a `CANCELLED` job ends `CANCELLED`. One audit event per ended job (`prerequisite <id> failed|timed out|was cancelled`). A retryable failure (`RETRY_WAIT`) does not propagate. Adding an edge to an already ended prerequisite ends the new dependent immediately. Requeuing a failed prerequisite never revives its ended dependents, and they cannot be requeued until every prerequisite has actually completed. A periodic safety net in the scheduler (`ResolveBlocked`) ends jobs stranded by changes made outside the repository.
 
-**Aging.** Every `aging_interval_ms` (default 60 s; 0 disables) a job has waited counts as one extra priority level, measured from `scheduled_at`. This has a clock-independent sort key (`scheduled_at − level × interval`), so a plain heap stays valid as time passes. A `LOW` job overtakes a fresh `CRITICAL` one after three intervals. The persisted priority is never modified (tested).
-
-**Redis structures.** Identifiers and sort keys only, never job data: `{prefix}:ready:CRITICAL|HIGH|NORMAL|LOW` and `{prefix}:delayed` are sorted sets (member `<20-digit sequence>:<uuid>`, score `scheduled_at` in µs), `{prefix}:lock:reconcile` is a short-lived TTL lock, `{prefix}:sentinel` marks a reconciled Redis. A Lua script (`PopNext`) atomically dequeues the best head across the four queues with the same rule (including aging) as the C++ policy; a test compares both on random data. Why sorted sets, why padded members, why one set per priority: `docs/SCHEDULER.md`.
-
-**Reconciliation (PostgreSQL wins).** Pages through READY and PENDING/RETRY_WAIT jobs (keyset on `(scheduled_at, sequence)`) and through Redis, then adds what is missing or wrongly scored and removes what is stale, re-checking each removal against PostgreSQL first. Handled and tested: READY missing from Redis; entries for COMPLETED/CANCELLED/unknown jobs; wrong priority queue; READY job in the delayed set; wrong score; malformed members; total loss (`FLUSHDB`, container restart). Redis loss is noticed within one tick (missing sentinel). It never modifies job state.
-
-**Multi-scheduler safety.** Promotion is guarded by PostgreSQL (`SKIP LOCKED` + status predicate re-checked under the lock): a job is promoted by exactly one scheduler, with no global lock. Redis writes are idempotent. Only reconciliation takes a Redis lock: short-lived (`lock_ttl_ms`), owner-token checked on release, expires by itself if its holder crashes. Test: 5 schedulers × the same 100 jobs → 100 promotions, 100 `READY` events (one per job), every row at version 2, no other states, Redis converged to exactly 100 unique entries.
-
-**Database changes.** None. The Phase 2 schema and indexes were sufficient; new repository queries only (`FindDueJobs`, `PromoteJobsToReady`, `FindReadyJobs`, `FindWaitingJobs`, `GetSchedulingEntries`; none read payloads). No `job_dependencies`, `workers` or lease tables.
-
-**Not built (later phases):** DAG dependencies (4), workers and job execution (5), leases/heartbeats (6), retries/timeouts/idempotency logic (7), any job API (8).
+**Concurrency strategy.** Every transaction that adds edges starts with `pg_advisory_xact_lock` (transaction-scoped: works across all application instances, auto-released at COMMIT/ROLLBACK/crash), then locks the involved jobs `FOR UPDATE` in ascending id order, loads the stored ancestors of the new prerequisites (recursive CTE), checks `stored ∪ new` for a cycle, and inserts. Opposite edges `X→Y` / `Y→X` are therefore strictly ordered and the second is refused. This serializes graph writes only (reads, scheduling and execution never take the lock). Isolation is READ COMMITTED; correctness comes from the lock, not from SERIALIZABLE. A failing prerequisite racing a submission is resolved by the row lock (whichever commits first, the dependent ends up `FAILED`, never stranded). Deadlocks (`40P01`) and serialization failures (`40001`) roll back the transaction and are retried up to 5 times with randomized backoff. Documented in `docs/DATABASE.md` ("Concurrency").
 
 ## Implemented Features
 
-- Everything from Phases 1–2.
-- Scheduler tick and background loop, priority heap, priority/FIFO/aging policy, delayed-job promotion, Redis ready/delayed queues with atomic Lua dequeue, reconciliation and Redis-loss recovery, multi-scheduler safe promotion, scheduler configuration (`scheduler.*` / `TASKFLOW_SCHEDULER_*`), baseline benchmark tool.
+- Everything from Phases 1–3.
+- DAG validation (cycles, topological order, ancestors/descendants), cycle-safe atomic edge and workflow creation, derived dependency readiness enforced in the scheduler and in the database, transitive failure/cancellation propagation, dependency safety net, dependency inspection queries, DAG benchmark tool.
 
 ## Architecture Summary
 
-As in `ARCHITECTURE.md` (sections 4–8 describe the lifecycle, state machine and scheduler as implemented). Implemented: infrastructure (Phase 1), persistent job layer (Phase 2), scheduler and queues (Phase 3). Not yet: DAG engine, retry manager, lease manager, worker manager, worker pool.
+As in `ARCHITECTURE.md` (sections 4–9 describe lifecycle, state machine, scheduler and DAG execution as implemented). Implemented: infrastructure (1), persistent job layer (2), scheduler and queues (3), dependency engine (4). Not yet: retry manager, lease manager, worker manager, worker pool.
 
 ## Technology Stack
 
-Locked (see `TECHSTACK.md`): C++20, CMake, Drogon, PostgreSQL, Redis, Docker, Docker Compose, GoogleTest, spdlog, JSON, Prometheus-compatible metrics, GitHub Actions. Package manager: vcpkg (manifest mode, baseline `4b308f5`). No new dependencies in Phase 3. Redis Lua scripting (built into Redis) is used for atomic dequeue/move.
+Locked (see `TECHSTACK.md`): C++20, CMake, Drogon, PostgreSQL, Redis, Docker, Docker Compose, GoogleTest, spdlog, JSON, Prometheus-compatible metrics, GitHub Actions. Package manager: vcpkg (manifest mode, baseline `4b308f5`). No new dependencies in Phase 4; no `TECHSTACK.md` change.
 
 ## Database Summary
 
-Unchanged from Phase 2: `schema_migrations`, `jobs`, `job_attempts`, `job_results`, `job_events` (4 migrations). Phase 3 query/index usage is documented in `docs/DATABASE.md` ("Scheduler queries"). `job_dependencies` arrives in Phase 4 and `workers` in Phase 5.
+Tables: `schema_migrations`, `jobs`, `job_attempts`, `job_results`, `job_events`, **`job_dependencies`** (5 migrations). Dependency schema, indexes, triggers, concurrency and migration/rollback notes: `docs/DATABASE.md` ("Dependencies"). `workers` arrives in Phase 5.
 
 ## API Summary
 
@@ -92,84 +86,83 @@ Unchanged from Phase 2: `schema_migrations`, `jobs`, `job_attempts`, `job_result
 |---|---|
 | `GET /health` | Unchanged: `200` with dependency status, or `503` `degraded`/`shutting_down`. |
 
-No job endpoints yet (Phase 8). The scheduler is configured and observed through configuration, logs and the database/Redis.
+No job or dependency endpoints yet (Phase 8).
 
 ## Testing Summary
 
-**259 tests, all passing**, against real PostgreSQL 16 and Redis 7 (no mocks of either):
+**340 tests, all passing**, against real PostgreSQL 16 and Redis 7 (no mocks of either):
 
-| Suite | Total | New in Phase 3 | Phase 3 coverage |
+| Suite | Total | New in Phase 4 | Phase 4 coverage |
 |---|---|---|---|
-| `taskflow_unit_tests` | 99 | 26 | heap: priority order, FIFO, empty/duplicate/stale entries, removal, 50,000-entry sorted-order check, randomized comparison with a reference model (aging on and off); policy: aging overtake, short waits keep priority, clock independence, no starvation under continuous CRITICAL traffic, priority never rewritten; Redis member encoding; scheduler config |
-| `taskflow_integration_tests` | 152 | 55 | repository scheduling queries (due boundary to the µs, per-priority limits, promotion with audit events, keyset paging, index use by the planner, 8 concurrent promoters); Redis queues (order, FIFO ties, aging, Lua pop vs C++ heap on random data, atomic move, chunking, locks incl. expiry and owner check, flush); scheduler (due vs delayed, boundary, time advancing, priority and FIFO order across ticks, retry-wait promotion, untouched states, aging and persisted priority, Redis flush recovery, stale/misplaced/wrong-score repair, paging, lock contention and expiry, Redis-down tolerance, 5 concurrent schedulers × 100 jobs, loop start/stop/prompt shutdown/tick timing) |
-| `taskflow_http_tests` | 8 | 1 | the real application runs the scheduler thread, which promotes a due job and queues it in Redis; shutdown stops the scheduler |
+| `taskflow_unit_tests` | 118 | 19 | graph: empty, single node, chain, the diamond from the specification, multiple parents, independent components, self-dependency, duplicate edges, unknown nodes, direct/indirect/second-component cycles with path validation, deterministic order, 200,000-job chain (no stack overflow), wide and layered graphs, 100,000-edge validation |
+| `taskflow_integration_tests` | 214 | 62 | schema (FKs, self/duplicate edges, guard triggers, deletion rules, the database refusing `READY` while a prerequisite is unfinished, index use), **upgrade from a Phase 3 database with data**, fresh-database migration, trigger parity (now 14 edges, 56 pairs), service (persistence, atomic multi-edge requests, direct/indirect/in-request cycles, validation without storing, workflows and their rollback incl. injected database failure), concurrency (40 rounds of opposite edges: exactly one succeeds; 8-job ring closed by 8 threads; prerequisite failing during submission; two parents failing together), propagation (chains, fan-out, timeout, cancel, running prerequisite, retryable failure, already-ended prerequisite, manual requeue, audit events, safety net), scheduler integration (blocked/released/multi-parent/diamond order/independent chains/failed prerequisite/candidate window/Redis loss and forged Redis entries/5 schedulers on a 60-way fan-out/two parents finishing together/delayed dependents), query-plan shape |
+| `taskflow_http_tests` | 8 | 0 | unchanged |
 
 Results (all in GitHub Codespaces):
 
-- Release build with `-Werror` (`ci` preset): **259/259 pass**, 0 skipped.
-- ASan + UBSan build: **259/259 pass**, 0 skipped, no sanitizer reports.
-- ThreadSanitizer, scheduler/queue/pool tests (84 tests): **all pass**, no data-race reports. The remaining suites were not run under TSan.
-- CI on GitHub for Phases 1 and 2: green on all three jobs each. **The Phase 3 CI run had not finished when this was written.**
+- Release build with `-Werror` (`ci` preset): **340/340 pass**, 0 skipped.
+- ASan + UBSan: **340/340 pass**, 0 skipped, no sanitizer reports.
+- ThreadSanitizer, all concurrency-related tests (scheduler, dependency service, DAG scheduler, queues, pool: 145 tests): **all pass**, no data-race reports. The remaining suites were not run under TSan.
+- CI on GitHub: Phases 1, 2 and 3 green on all three jobs. **The Phase 4 CI run had not finished when this was written.**
+- Bugs found and fixed by validation along the way: a migration foreign key whose `NO ACTION` check broke deleting a whole workflow in one statement (now deferred); a dependency filter whose join the planner could turn into a whole-table scan when `job_dependencies` had no statistics (rewritten, plan shape now tested); test mistakes.
 
-**Docker/Codespaces validation (live stack, Codespace `standardLinux32gb`: 4 vCPU, 16 GB, Docker 29.8, Compose 5.5), scheduler tick 200 ms, 2 promotions per tick:**
+**Docker/Codespaces validation (live stack: Codespace `standardLinux32gb`, 4 vCPU, 16 GB, Docker 29.8, scheduler tick 200 ms):**
 
-- PostgreSQL, Redis and TaskFlow built and reached healthy; log shows `migrations complete: 4 applied` and the scheduler started; `/health` `200`.
-- Inserted 2 delayed (+60 s) and 8 due jobs directly into PostgreSQL: the delayed jobs stayed `PENDING`; all 8 due jobs became `READY`.
-- Promotion order by `job_events` id was priorities `3 3 2 2 1 1 0 0` (CRITICAL, CRITICAL, HIGH, HIGH, NORMAL, NORMAL, LOW, LOW); 8 READY events for 8 distinct jobs.
-- Redis held 2 jobs in each ready queue and 2 in the delayed set. After `FLUSHALL` the scheduler restored all of it from PostgreSQL within seconds (log: `reconciled Redis (+8 ready … +2 delayed)`); the sum of job versions was identical before and after (18 = 18). After restarting the Redis container (no persistence) the same counts reappeared.
-- Setting the delayed jobs' `scheduled_at` to the past promoted them (all 10 jobs READY, delayed set empty); persisted priorities were untouched.
-- `docker compose stop taskflow`: logs `scheduler … stopped` then `shutdown complete`, exit code 0.
+- PostgreSQL, Redis and TaskFlow built and became healthy; log shows `migrations complete: 5 applied`; `/health` `200`; `schema_migrations` lists version 5 `create_job_dependencies`; `job_dependencies` has `pk_job_dependencies` and `idx_job_dependencies_prerequisite`.
+- Diamond workflow A → (B, C) → D → E plus an independent job X, all due: only A and X were released; B–E stayed `PENDING` although due. The database refused a manual `UPDATE … SET status='READY'` on a blocked job (`cannot become READY: it has prerequisites that are not COMPLETED`). Completing A released B and C together; completing B alone left D blocked; completing C released D; completing D released E. Release order from `job_events`: A > X > B > C > D > E, each job released exactly once.
+- A failed prerequisite (changed by raw SQL, bypassing the repository): its dependents G, H and I were ended `PENDING→FAILED` by the scheduler's safety net, with audit events naming the prerequisite.
+- Persistence: edges (10) and the blocked state survived restarting PostgreSQL and TaskFlow (`migrations complete: 0 applied`); completing the prerequisite afterwards released the dependent.
+- Redis `FLUSHALL` with a blocked job in the graph: after repair the ready queues held exactly the READY jobs, and the blocked job was in the delayed set, not in a ready queue.
+- Graceful shutdown: scheduler stopped, exit code 0.
 
 ## Performance Benchmarks
 
-First baseline, measured once (details, environment and caveats in `docs/benchmarks/scheduler-phase3.md`; Phase 9 does the formal benchmark). 5,000 jobs, one scheduler, PostgreSQL and Redis in containers on the same 4-vCPU VM:
+Baseline measured once on a shared Codespace VM; full tables, environment and caveats in `docs/benchmarks/dag-phase4.md`.
 
-| Measurement | p50 | p95 | p99 |
-|---|---|---|---|
-| Heap push, 100k jobs | 0.28 µs | 0.75 µs | 2.56 µs |
-| Heap pop (highest priority), 100k jobs | 1.48 µs | 2.18 µs | 2.54 µs |
-| Redis queue insert (one job) | 57.0 µs | 77.9 µs | 100.7 µs |
-| Redis queue extract (Lua `PopNext`) | 89.5 µs | 115.7 µs | 136.8 µs |
-| Redis queue insert, batch of 500 | 0.80 ms | 0.96 ms | 1.24 ms |
-| Scheduler tick (500 promotions + publish) | 46.0 ms | 101.7 ms | 101.7 ms |
-| PostgreSQL promotion, batch of 500 | 36.6 ms | 39.2 ms | 39.2 ms |
-| PostgreSQL promotion, per job | 73.2 µs | 78.4 µs | 78.4 µs |
+| Measurement | Result |
+|---|---|
+| Cycle check, 100,000-node chain / 100,000-edge wide graph / 297,000-edge layered graph | 0.9 ms / 0.4 ms / 2.6 ms |
+| Topological sort, same graphs | 3.2 ms / 1.6 ms / 6.1 ms (16–32 ns per edge) |
+| `CreateWorkflow`, 1,000 jobs + 1,900 edges in one transaction | 958 ms (1,044 jobs/s, 1,983 edges/s) |
+| `AddDependencies` onto a chain growing to 2,000 deep | p50 8.3 ms, p95 136 ms, p99 154 ms |
+| `ValidateEdges` finding a cycle through a 2,001-job chain | median 8.0 ms |
+| Failure propagation: 1,000 dependents / chain of 500 | 94 ms (10,633 jobs/s) / 675 ms (740 jobs/s) |
+| Readiness propagation through the scheduler (10 layers × 200 jobs) | 1,440 jobs/s in this run (1,440–1,902 across three runs) |
+| Phase 3 scheduler benchmark re-run with the dependency filter | 8,272–8,750 jobs/s (six runs) vs 9,642 in Phase 3 |
 
-**Scheduling throughput: 9,642 jobs/sec** (5,000 promoted and published in 0.519 s). **Reconciliation after `FLUSHDB`: 10,000 ready entries rebuilt in 41.9 ms.** The tick and promotion rows have only 10 samples each, so their percentiles are indicative.
+The dependency filter costs about 3–5 µs per candidate row (so the scheduler is ~10–15% slower for the same workload); `AddDependencies` has an unexplained bimodal latency (about 5% of calls take 130–200 ms). The numbers are indicative, not production capacity.
 
 ## Known Issues
 
-1. **Phase 3 CI not yet observed** (see Testing Summary); Phases 1–2 runs were green.
-2. **Reconciliation is not streaming.** It holds the expected and actual sets in memory; fine for hundreds of thousands of jobs, to be revisited with Phase 9 measurements.
-3. **Candidate window.** Each tick reads at most `candidates_per_priority` due jobs per priority (oldest first); the heap order is exact within that window, and a larger backlog drains over several ticks.
-4. **Redis pop is not a claim.** `PopNext` removes an entry from Redis but the job stays `READY` in PostgreSQL until Phase 5's worker wins `CreateAttempt`; reconciliation re-adds an unclaimed job. Duplicate or stale queue entries are therefore harmless but can cause a wasted claim attempt.
-5. **Briefly stale Redis.** Between a PostgreSQL commit and the Redis publish (or after a Redis outage) Redis can lag by up to one reconcile interval (`reconcile_interval_ticks × tick_interval_ms`, default 10 s), and a transient extra entry is removed by the next reconciliation.
-6. **Due detection uses PostgreSQL every tick** (by design, so a flushed Redis never delays promotion); the Redis delayed set is an index for consumers and inspection, not the due-detection path.
-7. **Requeued jobs keep their attempt count** (Phase 2; decision deferred to Phase 7). **The transition table will gain edges** (Phase 4 `PENDING→FAILED`; possibly a Phase 6 reclaim edge), each requiring the C++ table, the trigger migration and the parity test to change together.
-8. **Audit events depend on the repository**; a manual `psql` state change records none.
-9. `/health` latency is unbounded when a dependency hostname stops resolving (planned for Phase 8). `ctest` counts a skipped test as a pass (no test skipped in any final run).
-10. Linux only. The Codespace VM needed two kernel settings for the tests (`net.bridge.bridge-nf-call-iptables=0` for container networking, `vm.mmap_rnd_bits=28` for TSan); both are Codespace environment quirks, not project requirements (CI already applies the second).
-11. Local Windows Docker was not used for Phase 3 validation, per the Codespaces rule.
+1. **Phase 4 CI not yet observed** (see Testing Summary).
+2. **Dependency submission is serialized** by one advisory lock (deliberate, for cycle safety); its throughput is one transaction at a time. Reads, scheduling and execution are unaffected.
+3. **Cycle check cost grows with the stored ancestry** of the new prerequisites (bounded by 500,000 examined edges; larger graphs are rejected, not truncated).
+4. **`AddDependencies` latency is bimodal** (about 5% of calls 130–200 ms); cause not investigated.
+5. **Failure propagation down a long chain is slower per job than across a fan-out** (level by level: 740 vs 10,633 jobs/s).
+6. **`ResolveBlocked` scans the edges table** once per reconcile interval (default 10 ticks); fine to moderate graph sizes, to be indexed/streamed from Phase 9 measurements.
+7. **The scheduler's dependency check costs ~3–5 µs per candidate** (above). It is linear in candidates and independent of table size.
+8. **Per-job limits:** 1,000 prerequisites per job (checked per request; the limit is not re-counted against edges already stored).
+9. **The dependency filter relies on the planner honoring a subquery fence** (`OFFSET 0`); a test asserts the plan shape, so a PostgreSQL planner change would be caught.
+10. Carried over: Redis lag after outages, reconciliation holds full sets in memory, `Redis pop is not a claim`, requeued jobs keep their attempt count, audit events depend on the repository (a raw SQL change records none), `/health` latency is unbounded if a hostname stops resolving, `ctest` counts skips as passes (none occurred), Linux only.
+11. The Codespace VM needed two kernel settings for the tests (`net.bridge.bridge-nf-call-iptables=0`, `vm.mmap_rnd_bits=28`); both are Codespace quirks, not project requirements.
+12. Local Windows Docker was not used for Phase 4 validation, per the Codespaces rule.
 
 ## Important Decisions
 
 | Date | Decision |
 |------|----------|
-| 2026-10-07 | Locked 10-phase roadmap, architecture, and tech stack. |
-| 2026-10-07 | PostgreSQL = durable source of truth; Redis = rebuildable coordination layer. |
-| 2026-10-07 | Single binary with role flags; roles arrive with their phases. |
-| 2026-10-07 | At-least-once delivery with fencing tokens; exactly-once is not claimed. |
-| 2026-10-07 | All commits/pushes use `iamankoo <aniketraj00384@gmail.com>` only; no AI attribution. |
-| 2026-10-07 | vcpkg (manifest mode, pinned baseline); libpq and hiredis used directly; single `/health`; signals on a `sigwait` thread; integration tests fail rather than skip. |
-| 2026-10-07 | Eight-state job model (owner instruction), enforced in C++ and by a database trigger; `job_dependencies` → Phase 4, `workers` → Phase 5. |
-| 2026-10-13 | **Scheduling decision lives in an in-memory heap**, not in a database `ORDER BY`: PostgreSQL only finds eligible jobs; `PriorityPolicy` + `JobPriorityQueue` choose which are promoted. |
-| 2026-10-13 | **Aging is "one priority level per interval waited"**, the continuous form of the architecture's "one level after a threshold". It yields a clock-independent sort key (`scheduled_at − level × interval`), so a heap and a Redis script can evaluate it exactly. `ARCHITECTURE.md` section 7 updated. |
-| 2026-10-13 | **Redis ready queues are sorted sets** (one per priority, score `scheduled_at` µs, member `<padded sequence>:<uuid>`), not lists, so delayed/retried jobs come out in `scheduled_at` order and ties are FIFO; dequeue is one Lua script reproducing `PriorityPolicy`. Redis stores identifiers only. |
-| 2026-10-13 | **Due detection stays on PostgreSQL** (`idx_jobs_due`) every tick so Redis loss can never delay promotion; the Redis delayed set is a rebuildable index. |
-| 2026-10-13 | **Promotion = one `SKIP LOCKED` transaction**; no scheduler leader and no global lock. Only reconciliation takes a short, TTL-bounded, owner-checked Redis lock. |
-| 2026-10-13 | **No schema migration in Phase 3**: Phase 2 indexes already serve every scheduler query (verified with `EXPLAIN` tests). |
-| 2026-10-13 | The scheduler runs inside the application process when `scheduler.enabled` (default true); it is started before the HTTP loop and stopped after it. A separate scheduler role arrives with the Phase 8 role flags. |
-| 2026-10-13 | Docker validation for Phase 3 ran in GitHub Codespaces, not on the local Windows Docker, per the owner's rule. |
+| 2026-10-07 | Locked 10-phase roadmap, architecture, tech stack; PostgreSQL authoritative, Redis rebuildable; at-least-once with fencing; single binary with role flags; commits only as `iamankoo`. |
+| 2026-10-07 | vcpkg; libpq and hiredis used directly; single `/health`; signals on a `sigwait` thread; integration tests fail rather than skip. |
+| 2026-10-07 | Eight-state job model (owner instruction), enforced in C++ and by a database trigger. |
+| 2026-10-13 | Phase 3: heap decides promotion order; aging = one level per interval waited (clock-independent key); Redis sorted sets with an atomic Lua dequeue; due detection on PostgreSQL; `SKIP LOCKED` promotion; no Phase 3 migration. See `docs/SCHEDULER.md`. |
+| 2026-10-13 | **Dependency readiness is derived from the prerequisites' real states, not a stored `unmet_dependencies` counter.** Rationale: a counter can drift (manual requeue, repair), `COMPLETED` is permanent so the derived answer is monotone, and promotion re-checks under the row lock anyway. `ARCHITECTURE.md` and `Phases.md` updated. |
+| 2026-10-13 | **The database enforces readiness**: a trigger refuses any transition to `READY` while a prerequisite is not `COMPLETED`, so neither Redis nor any writer can bypass the DAG. |
+| 2026-10-13 | **Cycle safety by a transaction-scoped advisory lock** serializing graph writes across instances (not SERIALIZABLE, not a process mutex); graph writes only, so reads and scheduling are unaffected. Deadlocks/serialization failures are retried (5 attempts, randomized backoff). |
+| 2026-10-13 | **Failure policy:** failed/timed-out prerequisite → dependents `FAILED`; cancelled prerequisite → dependents `CANCELLED`; transitive; same transaction as the triggering transition; `RETRY_WAIT` does not propagate; ended dependents are not revived by a requeue. Adds `PENDING→FAILED`. |
+| 2026-10-13 | **Prerequisite foreign key is `DEFERRABLE INITIALLY DEFERRED`** (found by a test): a plain `NO ACTION` check can run before the cascade from a dependent removed its edge, making workflow deletion depend on row order. |
+| 2026-10-13 | **Dependency filter written as a fenced `NOT EXISTS` with a scalar primary-key lookup** (found by an A/B measurement): the plain-join form could be planned as a whole-table hash join when `job_dependencies` had no statistics; `LIMIT 1` does not work as a fence (PostgreSQL strips it from `EXISTS`). |
+| 2026-10-13 | `CreateWorkflow` validates shape and cycles in memory with stand-in ids first, creates jobs in topological order (so sequence numbers follow dependency order), then adds edges under the graph lock, all in one transaction. |
+| 2026-10-13 | Docker validation for Phase 4 ran in GitHub Codespaces, not on the local Windows Docker, per the owner's rule. |
 
 ## Git Commit History
 
@@ -178,10 +171,11 @@ First baseline, measured once (details, environment and caveats in `docs/benchma
 | `585b4b5` | docs: initialize TaskFlow architecture and development roadmap | Initialization |
 | `75e2548` | feat: complete TaskFlow phase 1 foundation | Phase 1 |
 | `c523e2e` | feat: complete TaskFlow phase 2 job persistence | Phase 2 |
-| _next commit on `main`_ | feat: complete TaskFlow phase 3 scheduler | Phase 3 |
+| `6227a7a` | feat: complete TaskFlow phase 3 scheduler | Phase 3 |
+| _next commit on `main`_ | feat: complete TaskFlow phase 4 DAG dependencies | Phase 4 |
 
-The Phase 3 commit hash is reported in the Phase 3 completion report and written into this table by the first commit of Phase 4.
+The Phase 4 commit hash is reported in the Phase 4 completion report and written into this table by the first commit of Phase 5.
 
 ## Next Phase
 
-**Phase 4 — DAG Dependency Engine** (NOT STARTED; begins only on the owner's instruction).
+**Phase 5 — Concurrent Worker Pool** (NOT STARTED; begins only on the owner's instruction).

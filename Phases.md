@@ -29,10 +29,10 @@ If documents conflict, stop and resolve the conflict before implementing. Archit
 
 | # | Phase | Status |
 |---|-------|--------|
-| 1 | Foundation & Project Infrastructure | Not started |
-| 2 | Job Model & Persistent State | Not started |
-| 3 | Scheduler & Priority Queue | Not started |
-| 4 | DAG Dependency Engine | Not started |
+| 1 | Foundation & Project Infrastructure | Complete |
+| 2 | Job Model & Persistent State | Complete |
+| 3 | Scheduler & Priority Queue | Complete |
+| 4 | DAG Dependency Engine | Complete |
 | 5 | Concurrent Worker Pool | Not started |
 | 6 | Job Leasing, Heartbeats & Failure Recovery | Not started |
 | 7 | Retries, Timeouts & Idempotency | Not started |
@@ -142,9 +142,9 @@ If documents conflict, stop and resolve the conflict before implementing. Archit
 
 **Implementation tasks.**
 - Dependency submission with cycle detection (reject cyclic graphs at submit time).
-- `PENDING` handling for jobs with dependencies: track unmet dependency count per job; add the `job_dependencies` migration.
-- On dependency success, atomically decrement counters and release newly-ready jobs to the scheduler.
-- Failure policy: a failed or cancelled upstream fails or cancels downstream jobs per policy (adding the `PENDING`→`FAILED` transition to the state machine), recursively.
+- `PENDING` handling for jobs with dependencies: readiness is derived from the prerequisites' actual states (no stored counter, so it cannot drift); add the `job_dependencies` migration (0005).
+- On dependency success, the dependent becomes promotable; the scheduler releases it exactly once (row lock re-check), and the database refuses any other route to `READY`.
+- Failure policy: a failed or timed-out upstream fails downstream jobs and a cancelled upstream cancels them, recursively and in the same transaction (adds the `PENDING`→`FAILED` transition to the state machine, in C++ and in the trigger).
 - Support for fan-out, fan-in, and diamond graphs; graph size limits.
 - Graph inspection queries (ancestors, descendants, topological view).
 

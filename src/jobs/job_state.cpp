@@ -11,8 +11,9 @@ namespace {
 
 using S = JobState;
 
-// Keep in sync with migrations/0001_create_jobs.sql (taskflow_guard_job_transition).
-constexpr std::array<S, 2> kFromPending = {S::kReady, S::kCancelled};
+// Keep in sync with the taskflow_guard_job_update trigger (migration 0005; originally 0001).
+// PENDING -> FAILED (Phase 4): a job whose prerequisite failed can never run.
+constexpr std::array<S, 3> kFromPending = {S::kReady, S::kCancelled, S::kFailed};
 constexpr std::array<S, 2> kFromReady = {S::kRunning, S::kCancelled};
 constexpr std::array<S, 5> kFromRunning = {S::kCompleted, S::kFailed, S::kRetryWait, S::kTimeout,
                                            S::kCancelled};

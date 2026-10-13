@@ -22,22 +22,23 @@ class SchemaMigrationTest : public SchemaFixture {
 TEST_F(SchemaMigrationTest, FreshDatabaseReceivesEveryPhase2Object) {
   auto runner = MigrationRunner(*pool_);
   const auto applied = runner.Run(LoadMigrations(TASKFLOW_SOURCE_MIGRATIONS_DIR));
-  EXPECT_EQ(applied, (std::vector<std::int64_t>{1, 2, 3, 4}));
+  EXPECT_EQ(applied, (std::vector<std::int64_t>{1, 2, 3, 4, 5}));
 
   for (const char* relation :
        {"schema_migrations", "jobs", "job_attempts", "job_results", "job_events",
         "idx_jobs_ready_queue", "idx_jobs_due", "idx_jobs_created_at", "idx_job_results_job",
-        "idx_job_events_job", "uq_job_attempts_one_running", "uq_jobs_idempotency_key",
+        "idx_job_events_job", "job_dependencies", "idx_job_dependencies_prerequisite", "uq_job_attempts_one_running", "uq_jobs_idempotency_key",
         "uq_jobs_sequence"}) {
     EXPECT_TRUE(ExistsRelation(relation)) << relation;
   }
 
   const auto history = runner.Applied();
-  ASSERT_EQ(history.size(), 4u);
+  ASSERT_EQ(history.size(), 5u);
   EXPECT_EQ(history[0].name, "create_jobs");
   EXPECT_EQ(history[1].name, "create_job_attempts");
   EXPECT_EQ(history[2].name, "create_job_results");
   EXPECT_EQ(history[3].name, "create_job_events");
+  EXPECT_EQ(history[4].name, "create_job_dependencies");
 }
 
 TEST_F(SchemaMigrationTest, RunningMigrationsAgainChangesNothing) {
@@ -60,7 +61,7 @@ TEST_F(SchemaMigrationTest, RunningMigrationsAgainChangesNothing) {
 
 TEST_F(SchemaMigrationTest, ShippedMigrationsAreNamedAndOrderedForwardOnly) {
   const auto migrations = LoadMigrations(TASKFLOW_SOURCE_MIGRATIONS_DIR);
-  ASSERT_EQ(migrations.size(), 4u);
+  ASSERT_EQ(migrations.size(), 5u);
   for (std::size_t i = 0; i < migrations.size(); ++i) {
     EXPECT_EQ(migrations[i].version, static_cast<std::int64_t>(i + 1));
     // The runner wraps each file in its own transaction, so a file must not open or end one.

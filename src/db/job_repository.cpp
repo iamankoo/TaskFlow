@@ -9,6 +9,8 @@
 #include <utility>
 
 #include "taskflow/common/errors.hpp"
+#include "taskflow/db/dependency_sql.hpp"
+#include "taskflow/db/retry.hpp"
 
 namespace taskflow {
 
@@ -174,17 +176,34 @@ JobResult RowToResult(const PgResult& r, std::size_t row) {
   if (state == "23503") throw NotFoundError("referenced row does not exist (" + e.constraint() + ")");
   if (state == "TF001") throw InvalidTransitionError(e.what());
   if (state == "TF002") throw ValidationError(e.what());
+  if (state == "TF004") throw ConflictError(e.what());  // unmet prerequisites / edge added to a released job
   throw;
 }
 
+// Runs a complete transaction. A deadlock or serialization failure rolls the transaction back
+// and is retried (RetryOnConflict); other database errors become domain errors.
 template <typename F>
 auto Translated(F&& body) -> decltype(body()) {
   try {
-    return body();
+    return RetryOnConflict(body);
   } catch (const DatabaseError& e) {
     TranslateDatabaseError(e);
   }
 }
+
+bool EndsInFailureOrCancellation(JobState state) {
+  return state == JobState::kFailed || state == JobState::kTimeout || state == JobState::kCancelled;
+}
+
+// "No unmet prerequisite": every prerequisite of the `jobs` row is COMPLETED (or it has none).
+// Written so the planner cannot get it wrong: OFFSET 0 stops PostgreSQL from flattening the subquery into an
+// anti-join (it cannot flatten a subquery that has an OFFSET; LIMIT 1 would not help, PostgreSQL strips it from
+// EXISTS), and the prerequisite's status is fetched by a scalar primary-key lookup instead of a join, so there is
+// no join method to choose badly when job_dependencies has no statistics yet (a fresh deployment). The cost is
+// a few microseconds per candidate row and follows the number of candidates, not the size of the jobs table.
+constexpr const char* kNoUnmetPrerequisites =
+    " AND NOT EXISTS (SELECT 1 FROM job_dependencies d WHERE d.job_id = jobs.id "
+    "AND (SELECT p.status FROM jobs p WHERE p.id = d.depends_on_id) <> 'COMPLETED' OFFSET 0)";
 
 void RequireId(const JobId& id) {
   if (id.empty()) throw ValidationError("job id is empty");
@@ -292,7 +311,16 @@ Job JobRepository::CreateJob(const NewJob& job) {
   return Translated([&] {
     auto lease = pool_.Acquire();
     PgTransaction tx(*lease);
-    const auto result = tx->Query(
+    Job created = CreateJobInTransaction(tx.connection(), job);
+    tx.Commit();
+    return created;
+  });
+}
+
+Job JobRepository::CreateJobInTransaction(PgConnection& connection, const NewJob& job) {
+  job.Validate();
+  {
+    const auto result = connection.Query(
         "INSERT INTO jobs (type, payload, metadata, priority, status, scheduled_at, "
         "max_attempts, retry_initial_delay_ms, retry_backoff_multiplier, retry_max_delay_ms, "
         "timeout_ms, idempotency_key) "
@@ -306,10 +334,9 @@ Job JobRepository::CreateJob(const NewJob& job) {
          DoubleText(job.retry.backoff_multiplier), std::to_string(job.retry.max_delay.count()),
          std::to_string(job.timeout.count()), OptionalText(job.idempotency_key)});
     Job created = RowToJob(result, 0);
-    InsertEvent(tx.connection(), created.id, std::nullopt, created.state, "job created");
-    tx.Commit();
+    InsertEvent(connection, created.id, std::nullopt, created.state, "job created");
     return created;
-  });
+  }
 }
 
 std::optional<Job> JobRepository::GetJob(const JobId& id) {
@@ -350,6 +377,8 @@ Job JobRepository::UpdateJobState(const JobId& id, JobState to, const StateChang
           {id.str(), change.reason.value_or("job cancelled")});
     }
     Job updated = ApplyTransition(tx.connection(), job, to, change, false);
+    // Jobs waiting for this one can never run now: end them in the same transaction.
+    if (EndsInFailureOrCancellation(to)) dependency_sql::PropagateFailure(tx.connection(), job.id, to);
     tx.Commit();
     return updated;
   });
@@ -497,6 +526,9 @@ JobResult JobRepository::StoreResult(const JobId& id, int attempt_number,
                        std::string(ToString(outcome.state));
     }
     ApplyTransition(tx.connection(), job, next_state, applied, outcome.success());
+    if (EndsInFailureOrCancellation(next_state)) {
+      dependency_sql::PropagateFailure(tx.connection(), job.id, next_state);
+    }
 
     const auto stored = tx->Query(ResultSelect() + "WHERE r.attempt_id = $1::bigint",
                                   {attempt.Value(0, 0)});
@@ -556,7 +588,7 @@ std::vector<SchedulingEntry> JobRepository::FindDueJobs(TimePoint now,
     const auto result = lease->Query(
         "SELECT " + SchedulingColumns() +
             " FROM jobs WHERE status IN ('PENDING', 'RETRY_WAIT') AND priority = $1::smallint "
-            "AND scheduled_at <= " + TimestampParam(2) +
+            "AND scheduled_at <= " + TimestampParam(2) + kNoUnmetPrerequisites +
             " ORDER BY scheduled_at, sequence LIMIT $3::bigint",
         {std::to_string(ToInt(priority)), ToMicros(now), std::to_string(limit_per_priority)});
     for (std::size_t i = 0; i < result.rows.size(); ++i) due.push_back(RowToEntry(result, i));
@@ -576,7 +608,7 @@ std::vector<SchedulingEntry> JobRepository::PromoteJobsToReady(const std::vector
         "WITH locked AS ("
         "  SELECT id, status FROM jobs"
         "  WHERE id = ANY($1::uuid[]) AND status IN ('PENDING', 'RETRY_WAIT')"
-        "    AND scheduled_at <= " + TimestampParam(2) +
+        "    AND scheduled_at <= " + TimestampParam(2) + kNoUnmetPrerequisites +
             "  FOR UPDATE SKIP LOCKED), "
             "promoted AS ("
             "  UPDATE jobs j SET status = 'READY' FROM locked l WHERE j.id = l.id"

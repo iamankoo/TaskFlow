@@ -202,6 +202,28 @@ TEST_F(SchedulerRepositoryTest, SchedulingQueriesUseTheRightIndexes) {
       "AND scheduled_at <= now() ORDER BY scheduled_at, sequence LIMIT 100");
   EXPECT_NE(due.find("idx_jobs_due"), std::string::npos) << due;
 
+  // The production due-job query, including the dependency filter exactly as JobRepository writes it, must stay
+  // candidate-driven: idx_jobs_due plus a per-candidate pk_job_dependencies lookup (a correlated SubPlan), whether or not
+  // job_dependencies has statistics yet. If PostgreSQL may flatten the subquery into an anti-join it can choose a
+  // scan of the whole jobs table (measured 2x slower at 20,000 rows and growing with table size); OFFSET 0 prevents that.
+  Sql("INSERT INTO job_dependencies (job_id, depends_on_id) "
+      "SELECT j.id, q.id FROM (SELECT id, row_number() OVER (ORDER BY sequence) rn FROM jobs WHERE type = 't' AND status = 'PENDING') j "
+      "JOIN (SELECT id, row_number() OVER (ORDER BY sequence) rn FROM jobs WHERE type = 't' AND status = 'PENDING') q ON q.rn = j.rn - 1");
+  const auto filtered_plan = [&] {
+    return plan_of(
+        "SELECT id::text, sequence, priority, status FROM jobs WHERE status IN ('PENDING','RETRY_WAIT') AND priority = 2 "
+        "AND scheduled_at <= now() AND NOT EXISTS (SELECT 1 FROM job_dependencies d WHERE d.job_id = jobs.id "
+        "AND (SELECT p.status FROM jobs p WHERE p.id = d.depends_on_id) <> 'COMPLETED' OFFSET 0) ORDER BY scheduled_at, sequence LIMIT 100");
+  };
+  for (const char* statistics : {"without statistics", "with statistics"}) {
+    if (std::string(statistics) == "with statistics") Sql("ANALYZE job_dependencies");
+    const std::string filtered = filtered_plan();
+    EXPECT_NE(filtered.find("idx_jobs_due"), std::string::npos) << statistics << ":\n" << filtered;
+    EXPECT_NE(filtered.find("SubPlan"), std::string::npos) << statistics << ": expected a correlated per-candidate check:\n" << filtered;
+    EXPECT_EQ(filtered.find("Anti Join"), std::string::npos) << statistics << ": the planner flattened the dependency filter:\n" << filtered;
+    EXPECT_EQ(filtered.find("Hash"), std::string::npos) << statistics << ": no hash join over jobs:\n" << filtered;
+  }
+
   const std::string ready = plan_of(
       "SELECT id FROM jobs WHERE status = 'READY' AND priority = 2 "
       "AND (scheduled_at, sequence) > (now() - interval '1 day', 0) ORDER BY scheduled_at, sequence LIMIT 100");

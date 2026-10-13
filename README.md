@@ -2,7 +2,7 @@
 
 A distributed job execution platform in C++20: REST API, priority scheduler, delayed jobs, DAG dependencies, concurrent worker pool, lease/heartbeat failure recovery, retries and idempotency. PostgreSQL is the durable source of truth; Redis is a fast, rebuildable coordination layer.
 
-> **Status:** Phase 3 of 10 complete (foundation, persistent job model, scheduler). Jobs are stored in PostgreSQL and the scheduler promotes due jobs to READY in priority order and queues them in Redis, but nothing executes them yet and there is no job API. See [`Phases.md`](Phases.md) for the roadmap, [`ARCHITECTURE.md`](ARCHITECTURE.md) for the design, [`TECHSTACK.md`](TECHSTACK.md) for the locked stack and [`summary.md`](summary.md) for what is actually implemented.
+> **Status:** Phase 4 of 10 complete (foundation, persistent job model, scheduler, DAG dependencies). Jobs are stored in PostgreSQL, can wait for other jobs (cycle-checked dependency graphs), and the scheduler promotes due, unblocked jobs to READY in priority order and queues them in Redis, but nothing executes them yet and there is no job API. See [`Phases.md`](Phases.md) for the roadmap, [`ARCHITECTURE.md`](ARCHITECTURE.md) for the design, [`TECHSTACK.md`](TECHSTACK.md) for the locked stack and [`summary.md`](summary.md) for what is actually implemented.
 
 ## Quick start (Docker)
 
@@ -41,8 +41,8 @@ Presets: `debug`, `release`, `asan` (AddressSanitizer + UBSan), `tsan` (ThreadSa
 
 | Suite | Needs services | Label | What it covers |
 |---|---|---|---|
-| `taskflow_unit_tests` | no | `unit` | config, errors, resource pool, logging, health service, migration loading, job state machine, job model validation, priority queue and aging |
-| `taskflow_integration_tests` | PostgreSQL, Redis | `integration` | connectivity, pooling, migration runner, Redis commands, application failure paths, job schema constraints and triggers, job repository, transaction rollback, scheduler, Redis queues, reconciliation, multi-scheduler safety |
+| `taskflow_unit_tests` | no | `unit` | config, errors, resource pool, logging, health service, migration loading, job state machine, job model validation, priority queue and aging, dependency graph (cycles, topological order, large graphs) |
+| `taskflow_integration_tests` | PostgreSQL, Redis | `integration` | connectivity, pooling, migration runner, Redis commands, application failure paths, job schema constraints and triggers, job repository, transaction rollback, scheduler, Redis queues, reconciliation, multi-scheduler safety, dependency schema and upgrade, cycle safety under concurrency, failure propagation, DAG scheduling |
 | `taskflow_http_tests` | PostgreSQL, Redis | `http` | the real server and `GET /health` over TCP, graceful shutdown |
 
 ```bash
@@ -75,7 +75,7 @@ include/taskflow/   public headers, one directory per module
 src/                implementations (common, config, logging, db, redis, api, app)
 tests/              unit/, integration/, http/, support/
 migrations/         versioned SQL (job schema: see docs/DATABASE.md)
-bench/              scheduler baseline benchmark (`taskflow_scheduler_bench`)
+bench/              scheduler and DAG baseline benchmarks (`taskflow_scheduler_bench`, `taskflow_dag_bench`)
 docker/             Dockerfile (toolchain, deps, build, test, runtime stages)
 .github/workflows/  CI
 ```
@@ -85,6 +85,7 @@ docker/             Dockerfile (toolchain, deps, build, test, runtime stages)
 | `common` | error types, generic bounded resource pool |
 | `jobs` | job domain model and the job state machine |
 | `scheduler` | priority heap and aging policy, Redis queues, the scheduler tick and reconciliation (`docs/SCHEDULER.md`) |
+| `dag` | in-memory dependency graph (cycle detection, topological order) and `DependencyService` (cycle-safe edge and workflow creation, propagation, inspection) |
 | `config` | defaults, JSON file, environment overrides, validation |
 | `logging` | spdlog setup, text or JSON output |
 | `db` | libpq connection, pool and transactions, forward-only migration runner, `JobRepository` (all job SQL) |

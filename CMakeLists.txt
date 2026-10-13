@@ -39,6 +39,9 @@ add_library(taskflow_core STATIC
   src/db/postgres.cpp
   src/db/migration_runner.cpp
   src/db/job_repository.cpp
+  src/db/dependency_sql.cpp
+  src/dag/dependency_graph.cpp
+  src/dag/dependency_service.cpp
   src/jobs/job.cpp
   src/jobs/job_state.cpp
   src/scheduler/priority_queue.cpp
@@ -66,6 +69,10 @@ if(TASKFLOW_BUILD_BENCHMARKS)
   target_compile_definitions(taskflow_scheduler_bench PRIVATE
     TASKFLOW_SOURCE_MIGRATIONS_DIR="${CMAKE_SOURCE_DIR}/migrations")
   target_link_libraries(taskflow_scheduler_bench PRIVATE taskflow_core taskflow_options)
+  add_executable(taskflow_dag_bench bench/dag_bench.cpp)
+  target_compile_definitions(taskflow_dag_bench PRIVATE
+    TASKFLOW_SOURCE_MIGRATIONS_DIR="${CMAKE_SOURCE_DIR}/migrations")
+  target_link_libraries(taskflow_dag_bench PRIVATE taskflow_core taskflow_options)
 endif()
 
 if(TASKFLOW_BUILD_TESTS)

@@ -11,6 +11,7 @@
 #include <vector>
 
 #include "taskflow/config/config.hpp"
+#include "taskflow/dag/dependency_service.hpp"
 #include "taskflow/db/job_repository.hpp"
 #include "taskflow/scheduler/priority_queue.hpp"
 #include "taskflow/scheduler/schedule_queue.hpp"
@@ -32,6 +33,7 @@ struct TickResult {
   std::size_t candidates = 0;  // due jobs read from PostgreSQL
   std::size_t promoted = 0;    // jobs this tick moved to READY
   bool redis_ok = true;        // false when publishing/reconciling hit a Redis error
+  std::size_t dependents_ended = 0;  // jobs ended by the dependency safety net this tick
   ReconcileReport reconcile;
   std::chrono::microseconds duration{0};
   std::vector<SchedulingEntry> promoted_entries;  // in the order they were chosen
@@ -72,6 +74,12 @@ class Scheduler {
   // Repairs Redis from PostgreSQL. Throws RedisError/DatabaseError on failure.
   ReconcileReport Reconcile();
 
+  // Optional. With a dependency service, the periodic pass also ends PENDING jobs that wait for a
+  // prerequisite that failed or was cancelled (a safety net: normally the transition that
+  // ended the prerequisite already did it). Promotion itself never needs it: jobs with unmet
+  // prerequisites are simply not promotable (see JobRepository::PromoteJobsToReady).
+  void SetDependencyService(DependencyService* dependencies) { dependencies_ = dependencies; }
+
   // Publish-after-commit hook for code that just persisted jobs: READY jobs go to the
   // ready queues, PENDING/RETRY_WAIT jobs to the delayed set. Other states are ignored.
   void Publish(const std::vector<SchedulingEntry>& entries);
@@ -96,6 +104,7 @@ class Scheduler {
   std::string instance_id_;
   PriorityPolicy policy_;
 
+  DependencyService* dependencies_ = nullptr;
   std::atomic<std::uint64_t> ticks_{0};
   std::atomic<bool> need_reconcile_{false};
 

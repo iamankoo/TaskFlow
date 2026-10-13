@@ -4,6 +4,7 @@
 #include <string>
 #include <string_view>
 #include <utility>
+#include <vector>
 
 namespace taskflow {
 
@@ -79,6 +80,18 @@ class ValidationError : public Error {
  public:
   explicit ValidationError(const std::string& message)
       : Error(ErrorCode::kInvalidArgument, message) {}
+};
+
+// A proposed dependency would make a job (transitively) wait for itself.
+class CycleError : public ValidationError {
+ public:
+  CycleError(const std::string& message, std::vector<std::string> cycle)
+      : ValidationError(message), cycle_(std::move(cycle)) {}
+  // Job ids along the cycle, first id repeated at the end (a -> b -> c -> a).
+  const std::vector<std::string>& cycle() const noexcept { return cycle_; }
+
+ private:
+  std::vector<std::string> cycle_;
 };
 
 class NotFoundError : public Error {

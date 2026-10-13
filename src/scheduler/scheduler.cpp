@@ -86,11 +86,15 @@ TickResult Scheduler::Tick() {
   result.promoted = promoted.size();
   result.promoted_entries = promoted;
 
+  const bool periodic = tick_number % config_.reconcile_interval_ticks == 0;
+  if (periodic && dependencies_ != nullptr) {
+    result.dependents_ended = dependencies_->ResolveBlocked(config_.max_promotions_per_tick);
+  }
+
   // 4./5. Make them available, then repair Redis if it is due. PostgreSQL has already
   // committed, so a Redis failure only schedules a repair for later.
   try {
     if (!promoted.empty()) queue_.MarkReady(promoted);
-    const bool periodic = tick_number % config_.reconcile_interval_ticks == 0;
     if (periodic || need_reconcile_.load() || !queue_.HasSentinel()) {
       result.reconcile = Reconcile();
       if (result.reconcile.ran) need_reconcile_.store(false);
