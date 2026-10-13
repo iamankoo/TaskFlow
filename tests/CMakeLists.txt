@@ -24,13 +24,17 @@ taskflow_add_tests(taskflow_unit_tests unit
   unit/health_service_test.cpp
   unit/migration_loader_test.cpp
   unit/job_state_test.cpp
-  unit/job_model_test.cpp)
+  unit/job_model_test.cpp
+  unit/priority_queue_test.cpp)
 
 taskflow_add_tests(taskflow_integration_tests integration
   integration/postgres_test.cpp
   integration/migration_runner_test.cpp
   integration/redis_test.cpp
   integration/schema_test.cpp
+  integration/scheduler_repository_test.cpp
+  integration/schedule_queue_test.cpp
+  integration/scheduler_test.cpp
   integration/job_repository_test.cpp
   integration/application_test.cpp)
 

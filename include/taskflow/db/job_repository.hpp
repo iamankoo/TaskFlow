@@ -20,6 +20,12 @@ struct StateChange {
   std::optional<std::int64_t> expected_version;  // optimistic concurrency token
 };
 
+// Keyset position for paging through scheduling entries ordered by (scheduled_at, sequence).
+struct ScanCursor {
+  TimePoint scheduled_at;
+  std::int64_t sequence = 0;
+};
+
 // All SQL for the job model lives here. Every method that changes more than one
 // row runs in a single PostgreSQL transaction, and every state change is
 // validated against the state machine (in C++ first, then again by a database
@@ -73,6 +79,32 @@ class JobRepository {
   std::vector<JobResult> GetResults(const JobId& id);  // oldest first
 
   std::vector<JobEvent> GetEvents(const JobId& id);  // oldest first
+
+  // ----- scheduler persistence (Phase 3). Retrieval and persistence only: the
+  // scheduling decisions live in Scheduler. These never load payloads. -----
+
+  // Jobs that are PENDING or RETRY_WAIT with scheduled_at <= now, up to `limit_per_priority`
+  // per priority, oldest first. Served by idx_jobs_due.
+  std::vector<SchedulingEntry> FindDueJobs(TimePoint now, std::size_t limit_per_priority);
+
+  // Moves the given jobs PENDING/RETRY_WAIT -> READY in ONE transaction, but only those that
+  // are still waiting and due at `now`. Rows another scheduler holds locked are skipped
+  // (FOR UPDATE SKIP LOCKED), so concurrent schedulers never promote a job twice. Writes one
+  // job_events row per promotion. Returns the promoted jobs, in the order of `ids`.
+  std::vector<SchedulingEntry> PromoteJobsToReady(const std::vector<JobId>& ids, TimePoint now);
+
+  // READY jobs of one priority ordered by (scheduled_at, sequence), strictly after `after`.
+  // Served by idx_jobs_ready_queue.
+  std::vector<SchedulingEntry> FindReadyJobs(JobPriority priority,
+                                             const std::optional<ScanCursor>& after,
+                                             std::size_t limit);
+
+  // PENDING and RETRY_WAIT jobs ordered by (scheduled_at, sequence), strictly after `after`.
+  std::vector<SchedulingEntry> FindWaitingJobs(const std::optional<ScanCursor>& after,
+                                               std::size_t limit);
+
+  // Current scheduling data for the given ids; unknown ids are omitted.
+  std::vector<SchedulingEntry> GetSchedulingEntries(const std::vector<JobId>& ids);
 
  private:
   PgPool& pool_;

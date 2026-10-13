@@ -127,7 +127,7 @@ Config Config::FromJson(const std::string& json_text) {
     throw ConfigError("invalid config JSON: " + errors);
   }
   if (!root.isObject()) throw ConfigError("config JSON must be an object");
-  RejectUnknownKeys(root, "", {"http", "postgres", "redis", "logging", "app"});
+  RejectUnknownKeys(root, "", {"http", "postgres", "redis", "logging", "scheduler", "app"});
 
   Config config;
   if (const auto* http = Section(root, "http")) {
@@ -168,6 +168,24 @@ Config Config::FromJson(const std::string& json_text) {
     ReadString(*logging, "logging", "level", config.logging.level);
     ReadString(*logging, "logging", "format", config.logging.format);
   }
+  if (const auto* scheduler = Section(root, "scheduler")) {
+    RejectUnknownKeys(*scheduler, "scheduler",
+                      {"enabled", "tick_interval_ms", "max_promotions_per_tick",
+                       "candidates_per_priority", "aging_interval_ms", "reconcile_interval_ticks",
+                       "scan_batch_size", "lock_ttl_ms", "redis_prefix"});
+    ReadBool(*scheduler, "scheduler", "enabled", config.scheduler.enabled);
+    ReadUnsigned(*scheduler, "scheduler", "tick_interval_ms", config.scheduler.tick_interval_ms);
+    ReadUnsigned(*scheduler, "scheduler", "max_promotions_per_tick",
+                 config.scheduler.max_promotions_per_tick);
+    ReadUnsigned(*scheduler, "scheduler", "candidates_per_priority",
+                 config.scheduler.candidates_per_priority);
+    ReadUnsigned(*scheduler, "scheduler", "aging_interval_ms", config.scheduler.aging_interval_ms);
+    ReadUnsigned(*scheduler, "scheduler", "reconcile_interval_ticks",
+                 config.scheduler.reconcile_interval_ticks);
+    ReadUnsigned(*scheduler, "scheduler", "scan_batch_size", config.scheduler.scan_batch_size);
+    ReadUnsigned(*scheduler, "scheduler", "lock_ttl_ms", config.scheduler.lock_ttl_ms);
+    ReadString(*scheduler, "scheduler", "redis_prefix", config.scheduler.redis_prefix);
+  }
   if (const auto* app = Section(root, "app")) {
     RejectUnknownKeys(*app, "app",
                       {"auto_migrate", "migrations_dir", "startup_timeout_seconds",
@@ -207,6 +225,16 @@ void Config::ApplyEnvironment(const EnvLookup& env) {
   EnvString(env, "TASKFLOW_LOG_LEVEL", logging.level);
   EnvString(env, "TASKFLOW_LOG_FORMAT", logging.format);
 
+  EnvBool(env, "TASKFLOW_SCHEDULER_ENABLED", scheduler.enabled);
+  EnvUnsigned(env, "TASKFLOW_SCHEDULER_TICK_INTERVAL_MS", scheduler.tick_interval_ms);
+  EnvUnsigned(env, "TASKFLOW_SCHEDULER_MAX_PROMOTIONS_PER_TICK", scheduler.max_promotions_per_tick);
+  EnvUnsigned(env, "TASKFLOW_SCHEDULER_CANDIDATES_PER_PRIORITY", scheduler.candidates_per_priority);
+  EnvUnsigned(env, "TASKFLOW_SCHEDULER_AGING_INTERVAL_MS", scheduler.aging_interval_ms);
+  EnvUnsigned(env, "TASKFLOW_SCHEDULER_RECONCILE_INTERVAL_TICKS", scheduler.reconcile_interval_ticks);
+  EnvUnsigned(env, "TASKFLOW_SCHEDULER_SCAN_BATCH_SIZE", scheduler.scan_batch_size);
+  EnvUnsigned(env, "TASKFLOW_SCHEDULER_LOCK_TTL_MS", scheduler.lock_ttl_ms);
+  EnvString(env, "TASKFLOW_SCHEDULER_REDIS_PREFIX", scheduler.redis_prefix);
+
   EnvBool(env, "TASKFLOW_AUTO_MIGRATE", app.auto_migrate);
   EnvString(env, "TASKFLOW_MIGRATIONS_DIR", app.migrations_dir);
   EnvUnsigned(env, "TASKFLOW_STARTUP_TIMEOUT_SECONDS", app.startup_timeout_seconds);
@@ -240,6 +268,22 @@ void Config::Validate() const {
           "logging.level must be one of trace|debug|info|warn|error|critical|off");
   Require(OneOf(logging.format, {"text", "json"}), "logging.format must be text or json");
 
+  Require(scheduler.tick_interval_ms >= 1 && scheduler.tick_interval_ms <= 3600000,
+          "scheduler.tick_interval_ms must be between 1 and 3600000");
+  Require(scheduler.max_promotions_per_tick >= 1 && scheduler.max_promotions_per_tick <= 100000,
+          "scheduler.max_promotions_per_tick must be between 1 and 100000");
+  Require(scheduler.candidates_per_priority >= 1 && scheduler.candidates_per_priority <= 100000,
+          "scheduler.candidates_per_priority must be between 1 and 100000");
+  Require(scheduler.aging_interval_ms <= 86400000, "scheduler.aging_interval_ms must be <= 86400000 (1 day)");
+  Require(scheduler.reconcile_interval_ticks >= 1, "scheduler.reconcile_interval_ticks must be >= 1");
+  Require(scheduler.scan_batch_size >= 1 && scheduler.scan_batch_size <= 100000,
+          "scheduler.scan_batch_size must be between 1 and 100000");
+  Require(scheduler.lock_ttl_ms >= 100 && scheduler.lock_ttl_ms <= 600000,
+          "scheduler.lock_ttl_ms must be between 100 and 600000");
+  Require(!scheduler.redis_prefix.empty() && scheduler.redis_prefix.size() <= 64 &&
+              scheduler.redis_prefix.find_first_of(" \t\r\n{}") == std::string::npos,
+          "scheduler.redis_prefix must be 1-64 characters without whitespace or braces");
+
   Require(!app.migrations_dir.empty(), "app.migrations_dir must not be empty");
   Require(app.startup_timeout_seconds <= 3600, "app.startup_timeout_seconds must be <= 3600");
   Require(app.shutdown_grace_ms <= 60000, "app.shutdown_grace_ms must be <= 60000");
@@ -266,6 +310,8 @@ std::string Config::Describe() const {
       << postgres.database << " pg_pool=" << postgres.pool_size << " redis=" << redis.host << ':'
       << redis.port << '/' << redis.database << " redis_pool=" << redis.pool_size
       << " log=" << logging.level << '/' << logging.format
+      << " scheduler=" << (scheduler.enabled ? "on" : "off") << " tick=" << scheduler.tick_interval_ms
+      << "ms aging=" << scheduler.aging_interval_ms << "ms"
       << " auto_migrate=" << (app.auto_migrate ? "true" : "false")
       << " migrations_dir=" << app.migrations_dir;
   return out.str();

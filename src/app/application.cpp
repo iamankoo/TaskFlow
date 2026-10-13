@@ -71,6 +71,12 @@ void Application::Initialize() {
   health_->AddProbe("postgres", [this] { postgres_->Ping(); });
   health_->AddProbe("redis", [this] { redis_->Ping(); });
 
+  if (config_.scheduler.enabled) {
+    jobs_ = std::make_unique<JobRepository>(*postgres_);
+    schedule_queue_ = std::make_unique<ScheduleQueue>(*redis_, config_.scheduler.redis_prefix);
+    scheduler_ = std::make_unique<Scheduler>(*jobs_, *schedule_queue_, config_.scheduler);
+  }
+
   http_ = std::make_unique<HttpServer>(config_.http, *health_);
 }
 
@@ -83,7 +89,9 @@ void Application::Migrate() {
 int Application::Run() {
   if (!http_) throw LifecycleError("Run() called before Initialize()");
   if (shutdown_requested_.load()) return 0;  // asked to stop while still starting
+  if (scheduler_) scheduler_->Start();
   http_->Run();
+  if (scheduler_) scheduler_->Stop();  // finish the current tick, then stop
   spdlog::info("shutdown complete");
   return 0;
 }

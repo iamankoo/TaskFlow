@@ -64,6 +64,20 @@ Deliberately **not** created, to avoid write cost with no demonstrated query: a 
 
 Two tests assert the two scheduler-facing indexes are actually chosen by the planner for the queries they are designed for.
 
+## Scheduler queries (Phase 3)
+
+No schema change was needed: the Phase 2 indexes were designed for these queries, and tests assert the planner uses them.
+
+| Query (`JobRepository`) | Index | Notes |
+|---|---|---|
+| `FindDueJobs` — `status IN ('PENDING','RETRY_WAIT') AND priority = p AND scheduled_at <= now ORDER BY scheduled_at, sequence LIMIT n` (once per priority) | `idx_jobs_due` | oldest first; no payload columns are read |
+| `PromoteJobsToReady` — `SELECT … WHERE id = ANY($1) AND status IN (…) AND scheduled_at <= now FOR UPDATE SKIP LOCKED`, `UPDATE … SET status = 'READY'`, `INSERT INTO job_events`, in one statement/transaction | primary key | `SKIP LOCKED` is what makes concurrent schedulers safe; the status/time predicate is re-checked under the lock |
+| `FindReadyJobs` — `status = 'READY' AND priority = p AND (scheduled_at, sequence) > cursor ORDER BY scheduled_at, sequence LIMIT n` | `idx_jobs_ready_queue` | keyset pagination for reconciliation |
+| `FindWaitingJobs` — `status IN ('PENDING','RETRY_WAIT') AND (scheduled_at, sequence) > cursor …` | `idx_jobs_due` | keyset pagination for reconciliation |
+| `GetSchedulingEntries` — `WHERE id = ANY($1)` | primary key | verifies stale Redis entries before removal |
+
+Promotion writes the same `PENDING|RETRY_WAIT → READY` transition the Phase 2 state machine already allows, and the same audit event (`reason = 'scheduled time reached'`).
+
 ## Conventions
 
 - Timestamps are `timestamptz`; the C++ layer exchanges them as exact microseconds since the Unix epoch.

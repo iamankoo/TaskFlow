@@ -13,6 +13,9 @@
 #include <vector>
 
 #include "taskflow/app/application.hpp"
+#include "taskflow/db/job_repository.hpp"
+#include "taskflow/db/migration_runner.hpp"
+#include "taskflow/scheduler/schedule_queue.hpp"
 #include "taskflow/version.hpp"
 #include "test_support.hpp"
 
@@ -86,8 +89,17 @@ class HealthEndpointTest : public ::testing::Test {
       const char* port = std::getenv("TASKFLOW_TEST_HTTP_PORT");
       config_.http.host = "127.0.0.1";
       config_.http.port = static_cast<std::uint16_t>(port ? std::atoi(port) : 18080);
+      // Isolated schema with the real migrations, and Redis database 15, so the scheduler that
+      // runs inside the application works on private data.
+      schema_ = testing::UniqueName("tf_http");
+      PgConnection::Connect(config_.postgres)->Exec("CREATE SCHEMA " + schema_);
+      config_.postgres.options = "-csearch_path=" + schema_;
+      config_.redis.database = 15;
+      config_.scheduler.enabled = true;
+      config_.scheduler.tick_interval_ms = 50;
+      config_.scheduler.redis_prefix = testing::UniqueName("tfhttp");
       config_.app.auto_migrate = true;
-      config_.app.migrations_dir = migrations_.path().string();  // empty: only creates schema_migrations
+      config_.app.migrations_dir = TASKFLOW_SOURCE_MIGRATIONS_DIR;
       config_.app.shutdown_grace_ms = 1500;
 
       app_ = std::make_unique<Application>(config_);
@@ -109,6 +121,14 @@ class HealthEndpointTest : public ::testing::Test {
     if (app_) app_->RequestShutdown();
     if (server_thread_.joinable()) server_thread_.join();
     app_.reset();
+    try {
+      auto admin = PgConnection::Connect(testing::IntegrationConfig().postgres);
+      admin->Exec("DROP SCHEMA IF EXISTS " + schema_ + " CASCADE");
+      Config redis_config = testing::IntegrationConfig();
+      redis_config.redis.database = 15;
+      RedisClient(redis_config.redis).Execute({"FLUSHDB"});
+    } catch (const Error&) {
+    }
   }
 
   // A failure in SetUpTestSuite would make gtest report the tests as skipped,
@@ -118,7 +138,7 @@ class HealthEndpointTest : public ::testing::Test {
   static HttpResponse Get(const std::string& path) { return Send(config_.http.port, "GET", path); }
 
   static Config config_;
-  static testing::TempDir migrations_;
+  static std::string schema_;
   static std::unique_ptr<Application> app_;
   static std::thread server_thread_;
   static int exit_code_;
@@ -126,7 +146,7 @@ class HealthEndpointTest : public ::testing::Test {
 };
 
 Config HealthEndpointTest::config_;
-testing::TempDir HealthEndpointTest::migrations_;
+std::string HealthEndpointTest::schema_;
 std::unique_ptr<Application> HealthEndpointTest::app_;
 std::thread HealthEndpointTest::server_thread_;
 int HealthEndpointTest::exit_code_ = -1;
@@ -172,6 +192,28 @@ TEST_F(HealthEndpointTest, HandlesConcurrentRequests) {
   for (auto& request : requests) EXPECT_EQ(request.get(), 200);
 }
 
+TEST_F(HealthEndpointTest, TheSchedulerRunsInsideTheApplicationAndPromotesDueJobs) {
+  ASSERT_NE(app_->scheduler(), nullptr);
+  EXPECT_TRUE(app_->scheduler()->running());
+
+  JobRepository jobs(app_->postgres());
+  NewJob job;
+  job.type = "http.test";
+  job.priority = JobPriority::kHigh;
+  job.scheduled_at = std::chrono::system_clock::now() - std::chrono::seconds(1);  // already due
+  const Job created = jobs.CreateJob(job);
+
+  JobState state = JobState::kPending;
+  for (int i = 0; i < 100 && state != JobState::kReady; ++i) {
+    std::this_thread::sleep_for(50ms);
+    state = jobs.GetJob(created.id)->state;
+  }
+  EXPECT_EQ(state, JobState::kReady) << "the scheduler thread did not promote the job";
+
+  ScheduleQueue queue(app_->redis(), config_.scheduler.redis_prefix);
+  EXPECT_EQ(queue.ReadyCount(JobPriority::kHigh), 1u);
+}
+
 TEST_F(HealthEndpointTest, ZzShutdownReportsUnhealthyThenStopsCleanly) {
   app_->RequestShutdown();
 
@@ -182,6 +224,7 @@ TEST_F(HealthEndpointTest, ZzShutdownReportsUnhealthyThenStopsCleanly) {
 
   server_thread_.join();
   EXPECT_EQ(exit_code_, 0);
+  EXPECT_FALSE(app_->scheduler()->running()) << "the scheduler must stop with the application";
 }
 
 }  // namespace

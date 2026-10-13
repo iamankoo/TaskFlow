@@ -5,6 +5,7 @@
 #include <locale>
 #include <memory>
 #include <sstream>
+#include <unordered_map>
 #include <utility>
 
 #include "taskflow/common/errors.hpp"
@@ -244,6 +245,42 @@ bool OutcomeAllows(AttemptState outcome, JobState next) {
     case AttemptState::kRunning: return false;
   }
   return false;
+}
+
+// ---------- scheduling queries ----------
+
+const std::string& SchedulingColumns() {
+  static const std::string columns =
+      "id::text, sequence, priority, status, " + EpochMicros("scheduled_at");
+  return columns;
+}
+
+SchedulingEntry RowToEntry(const PgResult& r, std::size_t row) {
+  SchedulingEntry entry;
+  entry.id = JobId::Parse(Required(r, row, 0));
+  entry.sequence = std::stoll(Required(r, row, 1));
+  entry.priority = JobPriorityFromInt(std::stoi(Required(r, row, 2)));
+  entry.state = ParseJobState(Required(r, row, 3));
+  entry.scheduled_at = FromMicros(Required(r, row, 4));
+  return entry;
+}
+
+std::vector<SchedulingEntry> RowsToEntries(const PgResult& r) {
+  std::vector<SchedulingEntry> entries;
+  entries.reserve(r.rows.size());
+  for (std::size_t i = 0; i < r.rows.size(); ++i) entries.push_back(RowToEntry(r, i));
+  return entries;
+}
+
+// PostgreSQL array literal for a uuid[] parameter: {a,b,c}
+std::string UuidArray(const std::vector<JobId>& ids) {
+  std::string out = "{";
+  for (std::size_t i = 0; i < ids.size(); ++i) {
+    if (i != 0) out += ',';
+    out += ids[i].str();
+  }
+  out += '}';
+  return out;
 }
 
 }  // namespace
@@ -507,6 +544,104 @@ std::vector<JobEvent> JobRepository::GetEvents(const JobId& id) {
     events.push_back(std::move(event));
   }
   return events;
+}
+
+// ---------- JobRepository: scheduler persistence ----------
+
+std::vector<SchedulingEntry> JobRepository::FindDueJobs(TimePoint now,
+                                                         std::size_t limit_per_priority) {
+  auto lease = pool_.Acquire();
+  std::vector<SchedulingEntry> due;
+  for (const JobPriority priority : kPrioritiesHighestFirst) {
+    const auto result = lease->Query(
+        "SELECT " + SchedulingColumns() +
+            " FROM jobs WHERE status IN ('PENDING', 'RETRY_WAIT') AND priority = $1::smallint "
+            "AND scheduled_at <= " + TimestampParam(2) +
+            " ORDER BY scheduled_at, sequence LIMIT $3::bigint",
+        {std::to_string(ToInt(priority)), ToMicros(now), std::to_string(limit_per_priority)});
+    for (std::size_t i = 0; i < result.rows.size(); ++i) due.push_back(RowToEntry(result, i));
+  }
+  return due;
+}
+
+std::vector<SchedulingEntry> JobRepository::PromoteJobsToReady(const std::vector<JobId>& ids,
+                                                                TimePoint now) {
+  if (ids.empty()) return {};
+  return Translated([&] {
+    auto lease = pool_.Acquire();
+    PgTransaction tx(*lease);
+    // The CTE locks only rows that are still waiting and due and are not locked by another
+    // scheduler; the UPDATE and the audit rows are derived from exactly that set.
+    const auto result = tx->Query(
+        "WITH locked AS ("
+        "  SELECT id, status FROM jobs"
+        "  WHERE id = ANY($1::uuid[]) AND status IN ('PENDING', 'RETRY_WAIT')"
+        "    AND scheduled_at <= " + TimestampParam(2) +
+            "  FOR UPDATE SKIP LOCKED), "
+            "promoted AS ("
+            "  UPDATE jobs j SET status = 'READY' FROM locked l WHERE j.id = l.id"
+            "  RETURNING j.id, j.sequence, j.priority, j.status, j.scheduled_at, l.status AS previous), "
+            "audit AS ("
+            "  INSERT INTO job_events (job_id, from_status, to_status, reason)"
+            "  SELECT id, previous, 'READY', 'scheduled time reached' FROM promoted) "
+            "SELECT id::text, sequence, priority, status, " + EpochMicros("scheduled_at") +
+            " FROM promoted",
+        {UuidArray(ids), ToMicros(now)});
+    tx.Commit();
+
+    std::unordered_map<std::string, SchedulingEntry> by_id;
+    for (std::size_t i = 0; i < result.rows.size(); ++i) {
+      SchedulingEntry entry = RowToEntry(result, i);
+      by_id.emplace(entry.id.str(), std::move(entry));
+    }
+    std::vector<SchedulingEntry> ordered;  // keep the caller's (priority) order
+    ordered.reserve(by_id.size());
+    for (const JobId& id : ids) {
+      const auto found = by_id.find(id.str());
+      if (found != by_id.end()) ordered.push_back(found->second);
+    }
+    return ordered;
+  });
+}
+
+std::vector<SchedulingEntry> JobRepository::FindReadyJobs(JobPriority priority,
+                                                           const std::optional<ScanCursor>& after,
+                                                           std::size_t limit) {
+  auto lease = pool_.Acquire();
+  std::vector<Param> params{std::to_string(ToInt(priority))};
+  std::string sql = "SELECT " + SchedulingColumns() +
+                    " FROM jobs WHERE status = 'READY' AND priority = $1::smallint";
+  if (after) {
+    params.emplace_back(ToMicros(after->scheduled_at));
+    params.emplace_back(std::to_string(after->sequence));
+    sql += " AND (scheduled_at, sequence) > (" + TimestampParam(2) + ", $3::bigint)";
+  }
+  params.emplace_back(std::to_string(limit));
+  sql += " ORDER BY scheduled_at, sequence LIMIT $" + std::to_string(params.size()) + "::bigint";
+  return RowsToEntries(lease->Query(sql, params));
+}
+
+std::vector<SchedulingEntry> JobRepository::FindWaitingJobs(const std::optional<ScanCursor>& after,
+                                                             std::size_t limit) {
+  auto lease = pool_.Acquire();
+  std::vector<Param> params;
+  std::string sql = "SELECT " + SchedulingColumns() +
+                    " FROM jobs WHERE status IN ('PENDING', 'RETRY_WAIT')";
+  if (after) {
+    params.emplace_back(ToMicros(after->scheduled_at));
+    params.emplace_back(std::to_string(after->sequence));
+    sql += " AND (scheduled_at, sequence) > (" + TimestampParam(1) + ", $2::bigint)";
+  }
+  params.emplace_back(std::to_string(limit));
+  sql += " ORDER BY scheduled_at, sequence LIMIT $" + std::to_string(params.size()) + "::bigint";
+  return RowsToEntries(lease->Query(sql, params));
+}
+
+std::vector<SchedulingEntry> JobRepository::GetSchedulingEntries(const std::vector<JobId>& ids) {
+  if (ids.empty()) return {};
+  auto lease = pool_.Acquire();
+  return RowsToEntries(lease->Query(
+      "SELECT " + SchedulingColumns() + " FROM jobs WHERE id = ANY($1::uuid[])", {UuidArray(ids)}));
 }
 
 }  // namespace taskflow

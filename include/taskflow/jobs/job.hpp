@@ -2,6 +2,7 @@
 
 #include <json/json.h>
 
+#include <array>
 #include <chrono>
 #include <cstdint>
 #include <optional>
@@ -27,6 +28,10 @@ std::string_view ToString(JobPriority priority) noexcept;
 JobPriority ParseJobPriority(std::string_view text);                // throws ValidationError
 JobPriority JobPriorityFromInt(int value);                          // throws ValidationError
 constexpr int ToInt(JobPriority priority) noexcept { return static_cast<int>(priority); }
+
+// Every priority, most urgent first. Iterate this instead of hard-coding levels.
+inline constexpr std::array<JobPriority, 4> kPrioritiesHighestFirst = {
+    JobPriority::kCritical, JobPriority::kHigh, JobPriority::kNormal, JobPriority::kLow};
 
 // Strongly typed job identifier (a canonical lower-case UUID). Constructing one
 // from arbitrary text goes through Parse(), so an invalid id cannot propagate.
@@ -97,6 +102,15 @@ struct Job {
   TimePoint created_at;
   TimePoint updated_at;
   std::optional<TimePoint> finished_at;  // set exactly while the job is COMPLETED/FAILED/TIMEOUT/CANCELLED
+};
+
+// The few fields the scheduler needs to order a job. Scheduling never loads payloads.
+struct SchedulingEntry {
+  JobId id;
+  std::int64_t sequence = 0;  // global submission order, the FIFO tie-breaker
+  JobPriority priority = JobPriority::kNormal;
+  JobState state = JobState::kPending;
+  TimePoint scheduled_at;  // earliest run time; "waiting" is measured from here
 };
 
 // Fields that may be edited after submission, and only while the job has not

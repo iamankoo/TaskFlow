@@ -42,6 +42,20 @@ struct LoggingConfig {
   std::string format = "text";  // text|json
 };
 
+struct SchedulerConfig {
+  bool enabled = true;
+  unsigned tick_interval_ms = 1000;        // pause between scheduler ticks
+  unsigned max_promotions_per_tick = 500;  // PENDING/RETRY_WAIT -> READY per tick
+  unsigned candidates_per_priority = 500;  // due jobs read from PostgreSQL per priority per tick
+  // Every interval a job has waited counts as one extra priority level, so LOW cannot
+  // starve behind a steady stream of CRITICAL jobs. 0 disables aging (strict priority).
+  unsigned aging_interval_ms = 60000;
+  unsigned reconcile_interval_ticks = 10;  // PostgreSQL -> Redis repair every N ticks
+  unsigned scan_batch_size = 500;          // rows/entries per page while reconciling
+  unsigned lock_ttl_ms = 10000;            // lifetime of the reconciliation lock
+  std::string redis_prefix = "taskflow";   // namespace for every scheduler key in Redis
+};
+
 struct AppConfig {
   bool auto_migrate = true;
   std::string migrations_dir = "migrations";
@@ -58,6 +72,7 @@ struct Config {
   PostgresConfig postgres;
   RedisConfig redis;
   LoggingConfig logging;
+  SchedulerConfig scheduler;
   AppConfig app;
 
   // Precedence: built-in defaults < JSON file (optional) < TASKFLOW_* environment.

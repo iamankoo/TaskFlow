@@ -41,6 +41,9 @@ add_library(taskflow_core STATIC
   src/db/job_repository.cpp
   src/jobs/job.cpp
   src/jobs/job_state.cpp
+  src/scheduler/priority_queue.cpp
+  src/scheduler/schedule_queue.cpp
+  src/scheduler/scheduler.cpp
   src/redis/redis_client.cpp
   src/api/health_service.cpp
   src/api/http_server.cpp
@@ -56,6 +59,14 @@ target_link_libraries(taskflow_core
 
 add_executable(taskflow src/main.cpp)
 target_link_libraries(taskflow PRIVATE taskflow_core taskflow_options)
+
+option(TASKFLOW_BUILD_BENCHMARKS "Build the benchmark executables" ON)
+if(TASKFLOW_BUILD_BENCHMARKS)
+  add_executable(taskflow_scheduler_bench bench/scheduler_bench.cpp)
+  target_compile_definitions(taskflow_scheduler_bench PRIVATE
+    TASKFLOW_SOURCE_MIGRATIONS_DIR="${CMAKE_SOURCE_DIR}/migrations")
+  target_link_libraries(taskflow_scheduler_bench PRIVATE taskflow_core taskflow_options)
+endif()
 
 if(TASKFLOW_BUILD_TESTS)
   enable_testing()

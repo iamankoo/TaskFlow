@@ -111,13 +111,13 @@ If documents conflict, stop and resolve the conflict before implementing. Archit
 **Scope.** Scheduler loop, Redis-backed ready queue and delayed set, PostgreSQL reconciliation. Jobs are dequeued but not executed by workers yet (handoff interface only).
 
 **Implementation tasks.**
-- Priority levels and ordering rules (priority, then `run_at`, then FIFO via sequence).
-- Redis ready queue per priority and a Redis sorted set for delayed jobs scored by `run_at`.
+- Priority levels and ordering rules (priority, then `scheduled_at`, then FIFO via sequence), decided by an in-memory heap-based priority queue.
+- Redis ready queue per priority (sorted sets) and a Redis sorted set for delayed jobs scored by `scheduled_at`.
 - Delayed-job promoter moving due jobs to the ready queue atomically (Lua script).
 - Enqueue path: persist to PostgreSQL first, then publish to Redis.
 - Dequeue path: atomic claim with PostgreSQL confirming state transition.
 - Reconciliation loop that rebuilds Redis queues from PostgreSQL after Redis loss or divergence.
-- Starvation protection (aging) for low-priority jobs.
+- Starvation protection (aging): every aging interval waited counts as one extra priority level; ordering only, the persisted priority never changes.
 - Scheduler tick configuration and metrics hooks.
 
 **Expected deliverables.** Scheduler module, queue module, Lua scripts, reconciliation job.

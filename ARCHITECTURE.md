@@ -87,25 +87,31 @@ These 13 transitions are the only legal ones; everything else (for example `COMP
 
 ## 6. Scheduler Architecture
 
-The Scheduler runs a periodic tick (configurable) that is safe to run on multiple instances: all mutations are guarded by PostgreSQL row locks (`FOR UPDATE SKIP LOCKED`) or atomic Redis scripts, so multiple schedulers cooperate rather than conflict.
+The Scheduler (`docs/SCHEDULER.md`) runs a periodic tick (configurable) that is safe to run on multiple instances: promotion is guarded by PostgreSQL row locks (`FOR UPDATE SKIP LOCKED`), Redis writes are idempotent, and only reconciliation takes a short-lived, TTL-bounded Redis lock. Multiple schedulers cooperate rather than conflict. The scheduler changes job state only by `PENDING`/`RETRY_WAIT` → `READY`.
 
 Each tick:
-1. **Promote delayed jobs** whose `run_at` is due (Redis Lua script, then PostgreSQL transition `PENDING`→`READY`, or `RETRY_WAIT`→`READY` for retries).
-2. **Release dependency-ready jobs** produced by the DAG engine.
-3. **Sweep expired leases** (via Lease Manager).
-4. **Reconcile**: periodically compare PostgreSQL `READY`/`PENDING`/`RETRY_WAIT` jobs with Redis and repair any divergence (re-enqueue missing, drop stale).
-5. **Apply aging** to prevent starvation.
+1. **Find due jobs** in PostgreSQL (`PENDING`/`RETRY_WAIT` with `scheduled_at <= now`, served by `idx_jobs_due`).
+2. **Decide**: order the candidates with the in-memory priority heap (priority, FIFO, aging) and take the best N.
+3. **Promote** those N to `READY` in one PostgreSQL transaction, with one `job_events` row each.
+4. **Publish** the promoted jobs to the Redis ready queues (one Lua script also removes them from the delayed set).
+5. **Reconcile** periodically, immediately if Redis looks flushed (missing sentinel), or after a Redis error: repair Redis from PostgreSQL (re-enqueue missing, drop stale).
+6. *(later phases)* release dependency-ready jobs (Phase 4) and sweep expired leases (Phase 6).
+
+PostgreSQL commits before Redis is touched; a Redis failure never blocks or undoes a promotion.
 
 ## 7. Priority Scheduling
 
-- Priority levels (highest first): `CRITICAL`, `HIGH`, `NORMAL`, `LOW`.
-- Order: priority, then earliest `run_at`, then submission sequence (FIFO).
-- A Redis queue per priority level; dequeue scans from highest to lowest.
-- **Aging:** jobs waiting beyond a threshold are effectively promoted one level so low priority cannot starve indefinitely.
+- Priority levels (highest first): `CRITICAL`, `HIGH`, `NORMAL`, `LOW`; ordering is defined once, in `PriorityPolicy`.
+- Order: priority, then earliest `scheduled_at`, then submission `sequence` (FIFO).
+- The scheduling decision uses an indexed binary heap (`JobPriorityQueue`: push/pop/remove O(log n), duplicate-protected, supports invalidating stale entries). PostgreSQL identifies *eligible* jobs; it does not decide the order.
+- Redis keeps one sorted set per priority level (`ready:CRITICAL` … `ready:LOW`, score `scheduled_at`, member `<sequence>:<id>`). A single Lua script dequeues the best head across the four sets using exactly the same rule, including aging; a test checks it against the C++ heap.
+- **Aging:** every `aging_interval` a job has waited counts as one extra priority level (measured from `scheduled_at`), so a `LOW` job overtakes a fresh `CRITICAL` one after three intervals. This is the continuous form of "promoted one level after a threshold", and it has a time-independent sort key (`scheduled_at - level × interval`), which keeps the heap valid as time passes. Aging influences ordering only; the persisted priority is never changed. Interval 0 disables it.
 
 ## 8. Delayed Jobs
 
-Delayed jobs (`run_at` in the future, and retry backoffs) live in the PostgreSQL row (`state = PENDING`, or `RETRY_WAIT` for backoff, with `scheduled_at`) as truth, and in a Redis sorted set scored by `run_at` for efficient polling. A Lua script atomically moves due members to the ready queue. If Redis is lost, reconciliation rebuilds the sorted set from PostgreSQL.
+Delayed jobs (`scheduled_at` in the future, and retry backoffs) live in the PostgreSQL row (`state = PENDING`, or `RETRY_WAIT` for backoff, with `scheduled_at`) as truth, and in a Redis sorted set (`delayed`) scored by `scheduled_at` as a fast index. Due detection uses PostgreSQL's `idx_jobs_due`, so losing Redis never delays a promotion. Promotion moves the job out of the delayed set into its ready queue atomically (Lua). If Redis is lost, reconciliation rebuilds the sorted sets from PostgreSQL.
+
+Redis holds only identifiers and sort keys; PostgreSQL wins every disagreement.
 
 ## 9. DAG / Dependency Execution
 

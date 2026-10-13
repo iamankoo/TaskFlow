@@ -7,8 +7,11 @@
 #include "taskflow/api/health_service.hpp"
 #include "taskflow/api/http_server.hpp"
 #include "taskflow/config/config.hpp"
+#include "taskflow/db/job_repository.hpp"
 #include "taskflow/db/postgres.hpp"
 #include "taskflow/redis/redis_client.hpp"
+#include "taskflow/scheduler/schedule_queue.hpp"
+#include "taskflow/scheduler/scheduler.hpp"
 
 namespace taskflow {
 
@@ -49,6 +52,8 @@ class Application {
   PgPool& postgres();
   RedisClient& redis();
   HealthService& health();
+  // Null unless scheduler.enabled.
+  Scheduler* scheduler() { return scheduler_.get(); }
 
  private:
   void WaitForDependencies();
@@ -57,6 +62,9 @@ class Application {
   std::unique_ptr<PgPool> postgres_;
   std::unique_ptr<RedisClient> redis_;
   std::unique_ptr<HealthService> health_;
+  std::unique_ptr<JobRepository> jobs_;
+  std::unique_ptr<ScheduleQueue> schedule_queue_;
+  std::unique_ptr<Scheduler> scheduler_;
   std::unique_ptr<HttpServer> http_;
   std::atomic<bool> shutdown_requested_{false};
 };

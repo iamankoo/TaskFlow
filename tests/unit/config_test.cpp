@@ -111,6 +111,47 @@ TEST(ConfigTest, ValidationRejectsOutOfRangeValues) {
   EXPECT_THROW(rejects([](Config& c) { c.app.migrations_dir.clear(); })(), ConfigError);
 }
 
+TEST(ConfigTest, SchedulerDefaultsAreValidAndSensible) {
+  const Config config;
+  EXPECT_TRUE(config.scheduler.enabled);
+  EXPECT_EQ(config.scheduler.tick_interval_ms, 1000u);
+  EXPECT_EQ(config.scheduler.aging_interval_ms, 60000u);
+  EXPECT_EQ(config.scheduler.redis_prefix, "taskflow");
+  EXPECT_NO_THROW(config.Validate());
+}
+
+TEST(ConfigTest, SchedulerSettingsComeFromJsonAndEnvironment) {
+  testing::TempDir dir;
+  dir.Write("config.json", R"({"scheduler": {"tick_interval_ms": 250, "aging_interval_ms": 0,
+                              "max_promotions_per_tick": 10, "redis_prefix": "jobs"}})");
+  const Config config = Config::Load(dir.path() / "config.json",
+                                     FakeEnv({{"TASKFLOW_SCHEDULER_TICK_INTERVAL_MS", "75"},
+                                              {"TASKFLOW_SCHEDULER_ENABLED", "false"}}));
+  EXPECT_EQ(config.scheduler.tick_interval_ms, 75u);       // env beats file
+  EXPECT_EQ(config.scheduler.aging_interval_ms, 0u);       // file value (aging off)
+  EXPECT_EQ(config.scheduler.max_promotions_per_tick, 10u);
+  EXPECT_EQ(config.scheduler.redis_prefix, "jobs");
+  EXPECT_FALSE(config.scheduler.enabled);
+}
+
+TEST(ConfigTest, SchedulerValidationRejectsUnsafeValues) {
+  const auto rejects = [](auto mutate) {
+    Config config;
+    mutate(config);
+    return [config] { config.Validate(); };
+  };
+  EXPECT_THROW(rejects([](Config& c) { c.scheduler.tick_interval_ms = 0; })(), ConfigError);
+  EXPECT_THROW(rejects([](Config& c) { c.scheduler.max_promotions_per_tick = 0; })(), ConfigError);
+  EXPECT_THROW(rejects([](Config& c) { c.scheduler.candidates_per_priority = 0; })(), ConfigError);
+  EXPECT_THROW(rejects([](Config& c) { c.scheduler.aging_interval_ms = 90'000'000; })(), ConfigError);
+  EXPECT_THROW(rejects([](Config& c) { c.scheduler.reconcile_interval_ticks = 0; })(), ConfigError);
+  EXPECT_THROW(rejects([](Config& c) { c.scheduler.scan_batch_size = 0; })(), ConfigError);
+  EXPECT_THROW(rejects([](Config& c) { c.scheduler.lock_ttl_ms = 5; })(), ConfigError);
+  EXPECT_THROW(rejects([](Config& c) { c.scheduler.redis_prefix = ""; })(), ConfigError);
+  EXPECT_THROW(rejects([](Config& c) { c.scheduler.redis_prefix = "has space"; })(), ConfigError);
+  EXPECT_THROW(Config::FromJson(R"({"scheduler": {"tick": 5}})"), ConfigError);  // unknown key
+}
+
 TEST(ConfigTest, DescribeNeverRevealsSecrets) {
   Config config;
   config.postgres.password = "pg-secret-value";
